@@ -42,7 +42,7 @@ def main():
     train, evaluation = load_splits(cfg["data"])
     save_splits(train, evaluation)
     requested = len(train) * cfg["training"]["epochs"] * cfg["generation"]["candidates_per_question"]
-    print(f"device=cpu train={len(train)} heldout={len(evaluation)} sampled_actions={requested}; "
+    print(f"device={cfg.get('device', 'cpu')} train={len(train)} heldout={len(evaluation)} sampled_actions={requested}; "
           f"upper-bound QA calls={requested * (cfg['retrieval']['top_k'] + 1)}", flush=True)
 
     started = time.perf_counter()
