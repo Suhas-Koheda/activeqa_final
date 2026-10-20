@@ -6,6 +6,7 @@ data:
   dataset: ai4bharat/IndicQA
   config: indicqa.te
   cache_dir: data/cache
+  external_train_dataset: nlpctx/activeqa-telugu-rl-data
   external_train_file: data/indic_rag_te/train.jsonl
   external_dev_file: data/indic_rag_te/dev.jsonl
   train_examples: 16
