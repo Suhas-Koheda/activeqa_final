@@ -5,6 +5,18 @@ import time
 import torch
 
 
+def _context_token_mask(encoded, inputs, batch_index, device):
+    if "token_type_ids" in encoded:
+        return encoded["token_type_ids"][batch_index].eq(1).to(device)
+    try:
+        sequence_ids = encoded.sequence_ids(batch_index)
+    except (AttributeError, TypeError):
+        sequence_ids = None
+    if sequence_ids is None:
+        return None
+    return torch.tensor([sid == 1 for sid in sequence_ids], device=device)
+
+
 class TeluguQA:
     def __init__(self, name, cache_dir="models", max_length=384, stride=64, device="cpu"):
         from transformers import AutoTokenizer, AutoModelForQuestionAnswering
@@ -37,18 +49,10 @@ class TeluguQA:
         for batch_index in range(inputs["input_ids"].shape[0]):
             start_logits = output.start_logits[batch_index].clone()
             end_logits = output.end_logits[batch_index].clone()
-            if "token_type_ids" in encoded:
-                context_mask = encoded["token_type_ids"][batch_index].eq(1)
-            else:
-                # Fast tokenizers expose sequence IDs, letting us avoid decoding spans
-                # from the question or special tokens.
-                try:
-                    sequence_ids = encoded.sequence_ids(batch_index)
-                except (AttributeError, TypeError):
-                    sequence_ids = None
-                if sequence_ids is None:
-                    continue
-                context_mask = torch.tensor([sid == 1 for sid in sequence_ids], device=self.device)
+            # Tokenizer outputs stay on CPU; model inputs/logits may be on CUDA.
+            context_mask = _context_token_mask(encoded, inputs, batch_index, self.device)
+            if context_mask is None:
+                continue
             context_mask &= inputs["attention_mask"][batch_index].bool()
             if not context_mask.any():
                 continue

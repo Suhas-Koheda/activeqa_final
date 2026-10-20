@@ -5,6 +5,7 @@ from activeqa.rewards import token_f1,reward
 from activeqa.policy_gradient import RunningBaseline
 from activeqa.policy_gradient import reinforce_step
 from activeqa.data import _load_indicqa_json
+from activeqa.qa_model import _context_token_mask
 import json, tempfile, os
 
 def test_unicode_normalization_and_tokens():
@@ -33,6 +34,18 @@ def test_reinforce_step_updates_trainable_parameter():
     assert advantage == 1.0
     assert policy.grad is not None
     assert not torch.equal(old, policy.detach())
+
+def test_context_mask_matches_model_input_device():
+    import torch
+    devices = [torch.device("cpu")]
+    if torch.cuda.is_available():
+        devices.append(torch.device("cuda"))
+    for device in devices:
+        encoded = {"token_type_ids": torch.tensor([[0, 0, 1, 1]])}
+        inputs = {"attention_mask": torch.ones((1, 4), device=device)}
+        mask = _context_token_mask(encoded, inputs, 0, device)
+        assert mask.device == device
+        assert mask.tolist() == [False, False, True, True]
 
 
 def test_flatten_squad_style_indicqa_json():
