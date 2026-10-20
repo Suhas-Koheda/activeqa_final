@@ -3,6 +3,12 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+CONFIG_PATH="${1:-configs/colab_gpu.yaml}"
+if [[ ! -f "$CONFIG_PATH" ]]; then
+  echo "ERROR: config not found: $CONFIG_PATH" >&2
+  echo "Usage: bash scripts/run_colab.sh [configs/colab_gpu.yaml]" >&2
+  exit 2
+fi
 mkdir -p outputs/colab_logs data/hf_home
 RUN_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG_FILE="outputs/colab_logs/colab_${RUN_STAMP}.log"
@@ -10,6 +16,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "ActiveQA Telugu Colab GPU run started: $(date -Is)"
 echo "Project: $ROOT_DIR"
+echo "Config: $CONFIG_PATH"
 echo "Log: $LOG_FILE"
 export HF_HOME="${HF_HOME:-$ROOT_DIR/data/hf_home}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
@@ -71,9 +78,15 @@ run_stage() {
   if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv; fi
 }
 
-run_stage "prepare smoke split" python scripts/prepare_data.py --config configs/colab_gpu.yaml
-run_stage "REINFORCE smoke training" python scripts/train.py --config configs/colab_gpu.yaml
-run_stage "paired smoke evaluation" python scripts/evaluate.py --config configs/colab_gpu.yaml --checkpoint outputs/colab_policy.pt
+run_stage "prepare data split" python scripts/prepare_data.py --config "$CONFIG_PATH"
+run_stage "REINFORCE training" python scripts/train.py --config "$CONFIG_PATH"
+CHECKPOINT_PATH="$(python - "$CONFIG_PATH" <<'PY'
+import sys, yaml
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(yaml.safe_load(stream)["training"]["checkpoint"])
+PY
+)"
+run_stage "paired evaluation" python scripts/evaluate.py --config "$CONFIG_PATH" --checkpoint "$CHECKPOINT_PATH"
 
 echo
 echo "Run completed: $(date -Is)"

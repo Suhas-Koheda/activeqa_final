@@ -42,7 +42,15 @@ cd activeqa_final
 bash scripts/run_colab.sh
 ```
 
-The script checks that Colab has an enabled CUDA GPU, keeps Colab's installed CUDA PyTorch, installs the remaining Python dependencies, and runs data preparation, 16/8 smoke training, and paired evaluation using `configs/colab_gpu.yaml`. It writes a timestamped complete log to `outputs/colab_logs/` and saves the policy and machine-readable metrics under `outputs/`. It also removes an incompatible preinstalled `torchao` version when present; this experiment uses standard LoRA and does not need torchao. The script defaults to regular HTTP Hub downloads (`HF_HUB_DISABLE_XET=1`) and keeps model/data caches in the project directory. Colab storage is temporary; download or copy `outputs/` and cache directories to Drive before ending the session if you need to retain them. If you run the script outside Colab without PyTorch installed, it exits with a clear runtime message rather than installing a potentially incompatible PyTorch build.
+The script checks that Colab has an enabled CUDA GPU, keeps Colab's installed CUDA PyTorch, installs the remaining Python dependencies, and runs data preparation, training, and paired evaluation. It defaults to the 16/8 smoke config. It writes a timestamped complete log to `outputs/colab_logs/` and saves the policy and machine-readable metrics under `outputs/`. It also removes an incompatible preinstalled `torchao` version when present; this experiment uses standard LoRA and does not need torchao. The script defaults to regular HTTP Hub downloads (`HF_HUB_DISABLE_XET=1`) and keeps model/data caches in the project directory. Colab storage is temporary; download or copy `outputs/` and cache directories to Drive before ending the session if you need to retain them. If you run the script outside Colab without PyTorch installed, it exits with a clear runtime message rather than installing a potentially incompatible PyTorch build.
+
+To run the full available partition after a successful smoke test, use:
+
+```bash
+bash scripts/run_colab.sh configs/colab_full.yaml
+```
+
+This exploratory config uses 1,119 policy-training examples, 279 held-out examples, 2 actions and 2 epochs (4,476 policy updates). It still derives both partitions from IndicQA's only published Telugu test data, so it is not a clean benchmark. On the latest Tesla T4 smoke run, training took 10.3 s for 32 actions (0.322 s/action); scaling that rate predicts about 24 minutes for training. Evaluation took 12.85 s for 8 questions, predicting about 7.5 minutes for 279. Budget roughly 32 minutes plus setup/download overhead. Smoke-process peak RSS was 2.54 GB. These are linear estimates, not a guarantee; monitor the timestamped log and stop the cell if throughput is materially slower.
 
 The existing `configs/cpu.yaml` and `configs/smoke_test.yaml` remain CPU configurations. CUDA execution is opt-in through the Colab config; requesting CUDA on a machine without an available GPU exits with an explicit error.
 
