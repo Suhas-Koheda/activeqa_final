@@ -1,0 +1,32 @@
+device: cpu
+seed: 42
+cpu_threads: 4
+data:
+  dataset: ai4bharat/IndicQA
+  config: indicqa.te
+  cache_dir: data/cache
+  train_examples: null
+  eval_examples: null
+  eval_fraction: 0.2
+models:
+  reformulator: ai4bharat/MultiIndicParaphraseGenerationSS
+  qa: l3cube-pune/telugu-question-answering-squad-bert
+  cache_dir: models
+  lora_rank: 4
+  lora_alpha: 8
+generation:
+  candidates_per_question: 2
+  max_input_tokens: 96
+  max_new_tokens: 24
+  do_sample: true
+retrieval:
+  top_k: 3
+  max_context_chars: 1800
+training:
+  epochs: 2
+  learning_rate: 0.00001
+  gradient_clip_norm: 1.0
+  checkpoint_every_steps: 10
+  baseline_momentum: 0.9
+  checkpoint: outputs/policy.pt
+outputs: outputs

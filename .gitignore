@@ -1,0 +1,13 @@
+.venv/
+.pytest_cache/
+.agents/
+.aws/
+.codex/
+__pycache__/
+*.py[cod]
+models/
+data/cache/
+data/hf_home/
+outputs/*.pt
+outputs/*.json
+outputs/colab_logs/
