@@ -1,0 +1,22 @@
+{
+  "dataset": "ai4bharat/Indic-Rag-Suite",
+  "dataset_url": "https://huggingface.co/datasets/ai4bharat/Indic-Rag-Suite",
+  "viewer_api": "https://datasets-server.huggingface.co",
+  "config": "te",
+  "source_split": "train",
+  "source_model": "Meta-Llama-3.3-70B-Instruct (as listed in source records)",
+  "license": "MIT (source dataset card)",
+  "seed": 42,
+  "train_rows": 804,
+  "dev_rows": 200,
+  "train_articles": 69,
+  "dev_articles": 12,
+  "article_overlap": 0,
+  "rows_examined": 3000,
+  "unique_valid_rows_sampled": 1360,
+  "answer_in_context_filter": "Unicode letters/numbers/marks compacted; answer must occur in paragraph",
+  "minimum_context_characters": 100,
+  "split_method": "seeded random-offset sampling, then article-grouped train/dev split",
+  "limitation": "Synthetic QA from Telugu Wikipedia; sampled subset and automatic answer/context checks require human quality review.",
+  "created_unix": 1792518633
+}

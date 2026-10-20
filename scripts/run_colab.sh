@@ -3,10 +3,10 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
-CONFIG_PATH="${1:-configs/colab_gpu.yaml}"
+CONFIG_PATH="${1:-configs/colab_external_smoke.yaml}"
 if [[ ! -f "$CONFIG_PATH" ]]; then
   echo "ERROR: config not found: $CONFIG_PATH" >&2
-  echo "Usage: bash scripts/run_colab.sh [configs/colab_gpu.yaml]" >&2
+  echo "Usage: bash scripts/run_colab.sh [configs/colab_external_smoke.yaml]" >&2
   exit 2
 fi
 mkdir -p outputs/colab_logs data/hf_home
