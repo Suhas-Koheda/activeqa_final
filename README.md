@@ -10,7 +10,7 @@ The requested QA model is a BERT extractive QA checkpoint. Its Hugging Face repo
 
 Training reward is `token F1 + 0.1*EM + 0.1*entity signature preservation - invalid penalty`. The canonical supporting passage is used in the **training reward** along with training-only BM25 retrieval results. Primary evaluation uses each question's canonical supporting passage for every method, while BM25-only retrieval results are reported separately. QA candidate and context ranking uses extractive span log-confidence without references; this is a ranking heuristic, not a calibrated probability. Oracle selection is explicitly offline and uses references. Evaluation predictions include references for manual audit, but those references do not affect deployable candidate or context selection. Metrics are paired over fixed evaluation questions and predictions are saved as JSON. Repeated sampling is seeded, but generation is stochastic during training.
 
-Reformulation generation defaults to 64 output tokens. Any sampled sequence that reaches the generation limit without EOS is treated as incomplete and falls back to the original question for downstream scoring; its sampled token sequence still receives the REINFORCE invalid-action penalty.
+Reformulation generation explicitly supplies the model card's `<s>` and `</s>` token IDs and defaults to 64 output tokens. Any sampled sequence that reaches the generation limit without `</s>` is treated as incomplete and falls back to the original question for downstream scoring; its sampled token sequence still receives the REINFORCE invalid-action penalty.
 
 ## Fedora setup
 

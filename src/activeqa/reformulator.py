@@ -20,8 +20,22 @@ class Reformulator:
         self.target_lang_id=self.tokenizer._convert_token_to_id_with_added_voc(self.target_lang_token)
         if self.target_lang_id == self.tokenizer.unk_token_id:
             raise RuntimeError(f"Tokenizer does not contain required language token {self.target_lang_token}")
+        # The model card sets BOS/EOS explicitly; relying on a possibly incomplete
+        # generation_config can make generate() run to max_new_tokens every time.
+        self.bos_token_id=self.tokenizer._convert_token_to_id_with_added_voc("<s>")
+        self.eos_token_id=self.tokenizer._convert_token_to_id_with_added_voc("</s>")
+        if self.bos_token_id == self.tokenizer.unk_token_id:
+            raise RuntimeError("Tokenizer does not define the expected <s> start token")
+        if self.eos_token_id == self.tokenizer.unk_token_id:
+            self.eos_token_id=self.tokenizer.eos_token_id
+        if self.eos_token_id is None or self.eos_token_id == self.tokenizer.unk_token_id:
+            raise RuntimeError("Tokenizer does not define the expected </s> end token")
         self.model.config.decoder_start_token_id=self.target_lang_id
         self.model.generation_config.decoder_start_token_id=self.target_lang_id
+        self.model.config.bos_token_id=self.bos_token_id
+        self.model.config.eos_token_id=self.eos_token_id
+        self.model.generation_config.bos_token_id=self.bos_token_id
+        self.model.generation_config.eos_token_id=self.eos_token_id
         self.cache={}
         try:
             from peft import LoraConfig, get_peft_model, TaskType
@@ -60,8 +74,11 @@ class Reformulator:
         generation_kwargs={"max_new_tokens":max_new,"do_sample":do_sample,
                            "num_beams":max(1,n) if not do_sample else 1,
                            "num_return_sequences":n,
-                           "pad_token_id":self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id,
+                           "bos_token_id":self.bos_token_id,
+                           "eos_token_id":self.eos_token_id,
+                           "pad_token_id":self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.eos_token_id,
                            "decoder_start_token_id":self.target_lang_id}
+        generation_kwargs.update(no_repeat_ngram_size=3, encoder_no_repeat_ngram_size=3)
         if do_sample:
             generation_kwargs.update(top_p=.9,temperature=.9)
         with torch.inference_mode():
@@ -71,11 +88,11 @@ class Reformulator:
         for ids in seq:
             text=normalize(self.tokenizer.decode(ids,skip_special_tokens=True,clean_up_tokenization_spaces=False))
             tokens=ids.tolist()
-            terminated = self.tokenizer.eos_token_id is not None and self.tokenizer.eos_token_id in tokens
+            terminated = self.eos_token_id in tokens
             if tokens and tokens[0] == self.target_lang_id:
                 tokens=tokens[1:]
-            if self.tokenizer.eos_token_id in tokens:
-                tokens=tokens[:tokens.index(self.tokenizer.eos_token_id)+1]
+            if self.eos_token_id in tokens:
+                tokens=tokens[:tokens.index(self.eos_token_id)+1]
             else:
                 tokens=[x for x in tokens if x != self.tokenizer.pad_token_id]
             valid=self._valid(question,text,terminated=terminated)
