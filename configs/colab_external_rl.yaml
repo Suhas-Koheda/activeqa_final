@@ -1,5 +1,5 @@
-# Leakage-safe run: RL training uses a sampled external Indic-Rag-Suite Telugu train set;
-# the full IndicQA Telugu test split remains held out for evaluation.
+# Leakage-safe run: RL training uses the generated Indic-Rag-Suite Telugu train
+# set; the full IndicQA Telugu test split remains held out for evaluation.
 device: cuda
 seed: 42
 cpu_threads: 4
@@ -17,10 +17,10 @@ models:
   reformulator: ai4bharat/MultiIndicParaphraseGenerationSS
   qa: l3cube-pune/telugu-question-answering-squad-bert
   cache_dir: models
-  lora_rank: 4
-  lora_alpha: 8
+  lora_rank: 16
+  lora_alpha: 32
 generation:
-  candidates_per_question: 2
+  candidates_per_question: 4
   max_input_tokens: 96
   max_new_tokens: 64
   do_sample: true
@@ -28,10 +28,16 @@ retrieval:
   top_k: 3
   max_context_chars: 1200
 training:
-  epochs: 2
-  learning_rate: 0.00001
+  epochs: 3
+  learning_rate: 0.0001
+  batch_questions: 8
   gradient_clip_norm: 1.0
-  checkpoint_every_steps: 100
-  baseline_momentum: 0.9
+  checkpoint_every_steps: 50
   checkpoint: outputs/external_rl_policy.pt
+evaluation:
+  # Match the stochastic policy used in training instead of beam search.
+  do_sample: true
+  # BM25 diagnostics are ~75% of evaluation QA calls and score ~0.006 F1.
+  # Set true for the final reporting run if you want them.
+  retrieval_metrics: false
 outputs: outputs

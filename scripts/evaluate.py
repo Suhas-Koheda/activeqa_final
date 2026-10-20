@@ -29,7 +29,7 @@ def main():
 
     baseline_path = "outputs/eval_pretrained.json"
     torch.manual_seed(cfg["seed"])
-    pretrained = evaluate(heldout, ref, qa, retriever, cfg, baseline_path)
+    pretrained = evaluate(heldout, ref, qa, retriever, cfg, baseline_path, label="pretrained")
     combined = {"pretrained": pretrained}
     if args.checkpoint:
         from peft import set_peft_model_state_dict
@@ -38,7 +38,7 @@ def main():
             raise ValueError("Checkpoint base model does not match configured reformulator")
         set_peft_model_state_dict(ref.model, saved["adapter"])
         torch.manual_seed(cfg["seed"])
-        trained = evaluate(heldout, ref, qa, retriever, cfg, "outputs/eval_trained.json")
+        trained = evaluate(heldout, ref, qa, retriever, cfg, "outputs/eval_trained.json", label="reinforce_trained")
         combined["reinforce_trained"] = trained
     os.makedirs("outputs", exist_ok=True)
     with open("outputs/eval_metrics.json", "w", encoding="utf-8") as stream:

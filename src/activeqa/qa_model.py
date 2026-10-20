@@ -82,3 +82,57 @@ class TeluguQA:
                         char_end = int(offsets[batch_index, end, 1])
                         best = (score, context[char_start:char_end].strip())
         return best[1], time.perf_counter() - started, best[0]
+
+    @torch.inference_mode()
+    def answer_batch(self, questions, context):
+        """Answer several questions against one shared context in one forward pass.
+
+        Returns ``(answer, elapsed_seconds, confidence)`` per question, in input
+        order. This is used by training to score the original question and all
+        sampled rewrites together instead of one QA call each.
+        """
+        questions = list(questions)
+        if not questions:
+            return []
+        started = time.perf_counter()
+        encoded = self.tok(
+            questions, [context] * len(questions), return_tensors="pt",
+            truncation="only_second",
+            max_length=self.max_length, stride=self.stride,
+            return_overflowing_tokens=True, return_offsets_mapping=True,
+            padding=True,
+        )
+        offsets = encoded.pop("offset_mapping")
+        sample_map = encoded.pop("overflow_to_sample_mapping").tolist()
+        inputs = {key: value.to(self.device) for key, value in encoded.items()
+                  if key in self.forward_fields and key in {
+                      "input_ids", "attention_mask", "token_type_ids"}}
+        output = self.model(**inputs)
+        best = [(float("-inf"), "") for _ in questions]
+        for batch_index in range(inputs["input_ids"].shape[0]):
+            sample_index = sample_map[batch_index]
+            start_logits = output.start_logits[batch_index].clone()
+            end_logits = output.end_logits[batch_index].clone()
+            context_mask = _context_token_mask(encoded, inputs, batch_index, self.device)
+            if context_mask is None:
+                continue
+            context_mask &= inputs["attention_mask"][batch_index].bool()
+            if not context_mask.any():
+                continue
+            start_logits[~context_mask] = -1e9
+            end_logits[~context_mask] = -1e9
+            start_logp = torch.log_softmax(start_logits, dim=-1)
+            end_logp = torch.log_softmax(end_logits, dim=-1)
+            starts = torch.topk(start_logp, k=min(20, len(start_logp))).indices.tolist()
+            ends = torch.topk(end_logp, k=min(20, len(end_logp))).indices.tolist()
+            for start in starts:
+                for end in ends:
+                    if end < start or end - start > 30:
+                        continue
+                    score = float(start_logp[start] + end_logp[end])
+                    if score > best[sample_index][0]:
+                        char_start = int(offsets[batch_index, start, 0])
+                        char_end = int(offsets[batch_index, end, 1])
+                        best[sample_index] = (score, context[char_start:char_end].strip())
+        elapsed = time.perf_counter() - started
+        return [(answer, elapsed, score) for score, answer in best]

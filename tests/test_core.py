@@ -1,9 +1,9 @@
 import sys
 sys.path.insert(0,'src')
-from activeqa.preprocessing import normalize,tokens,entity_signature
+from activeqa.preprocessing import normalize,tokens,entity_signature,interrogatives
 from activeqa.rewards import token_f1,reward
 from activeqa.policy_gradient import RunningBaseline
-from activeqa.policy_gradient import reinforce_step
+from activeqa.policy_gradient import reinforce_step,reinforce_batch_step
 from activeqa.data import _load_indicqa_json
 from activeqa.qa_model import _context_token_mask
 from activeqa.selection import select_qa_score
@@ -63,6 +63,56 @@ def test_reformulator_rejects_generation_without_eos():
     from activeqa.reformulator import Reformulator
     reformulator = object.__new__(Reformulator)
     assert not reformulator._valid("ప్రశ్న 2024", "ప్రశ్న 2024", terminated=False)
+
+
+def test_interrogatives_classify_telugu_question_type():
+    assert interrogatives("ఇది ఎక్కడ ఉంది?") == {"where"}
+    assert interrogatives("ఇది ఎందుకు ఉంది?") == {"why"}
+    assert interrogatives("ఎవరు ముఖ్యమంత్రి?") == {"who"}
+
+
+def test_reformulator_rejects_question_type_change():
+    from activeqa.reformulator import Reformulator
+    reformulator = object.__new__(Reformulator)
+    assert not reformulator._valid("ఇది ఎక్కడ ఉంది?", "ఇది ఎందుకు ఉంది?")
+    assert reformulator._valid("ఇది ఎక్కడ ఉంది?", "ఇది ఎక్కడ ఉంటుంది?")
+
+
+def test_reinforce_batch_step_updates_trainable_parameter():
+    import torch
+    policy = torch.nn.Parameter(torch.tensor([0.1, 0.2]))
+    optimizer = torch.optim.SGD([policy], lr=0.1)
+    old = policy.detach().clone()
+    loss = reinforce_batch_step([torch.log(policy[0]), torch.log(policy[1])],
+                                [1.0, 0.0], optimizer, [policy], clip=1.0)
+    assert loss == loss  # finite
+    assert policy.grad is not None
+    assert not torch.equal(old, policy.detach())
+
+
+def test_sequence_logprob_batch_masks_uneven_padding():
+    import torch
+    from types import SimpleNamespace
+    from activeqa.reformulator import Reformulator
+    reformulator = object.__new__(Reformulator)
+    reformulator.device = torch.device("cpu")
+    reformulator.tokenizer = SimpleNamespace(pad_token_id=0)
+    reformulator._source = lambda question, max_input: {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "attention_mask": torch.ones((1, 3), dtype=torch.long),
+    }
+
+    class FakeModel(torch.nn.Module):
+        def forward(self, input_ids, attention_mask, labels):
+            batch, seq = labels.shape
+            return SimpleNamespace(logits=torch.zeros((batch, seq, 5)))
+
+    reformulator.model = FakeModel()
+    logprobs = reformulator.sequence_logprob_ids_batch(
+        "ప్రశ్న", [[1, 2], [1, 2, 3, 4]], max_input=96)
+    assert logprobs.shape == (2,)
+    expected = torch.tensor([-2.0, -4.0]) * torch.log(torch.tensor(5.0))
+    assert torch.allclose(logprobs, expected, atol=1e-6)
 
 
 def test_evaluation_candidate_choice_does_not_use_gold_answers(tmp_path):

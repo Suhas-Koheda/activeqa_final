@@ -1,6 +1,6 @@
 from __future__ import annotations
 import torch
-from .preprocessing import normalize, entity_signature
+from .preprocessing import normalize, entity_signature, interrogatives
 
 class Reformulator:
     def __init__(self, name, cache_dir="models", rank=4, alpha=8, language="te", device="cpu"):
@@ -95,9 +95,11 @@ class Reformulator:
                 tokens=tokens[:tokens.index(self.eos_token_id)+1]
             else:
                 tokens=[x for x in tokens if x != self.tokenizer.pad_token_id]
+            question_type_preserved=interrogatives(question).issubset(interrogatives(text))
             valid=self._valid(question,text,terminated=terminated)
             actions.append({"sampled_text":text,"candidate":text if valid else question,
-                            "valid":valid,"terminated":terminated,"token_ids":tokens})
+                            "valid":valid,"terminated":terminated,"token_ids":tokens,
+                            "question_type_preserved":question_type_preserved})
         return actions
 
     def _valid(self, original, candidate, terminated=True):
@@ -105,6 +107,9 @@ class Reformulator:
         if not terminated: return False
         if not candidate or len(candidate)>max(300,4*len(original)): return False
         if len(candidate)<2 or candidate==original: return False
+        # Preserve the answer type (which/who/when/where/why/how) as well as
+        # numeric/Latin entities; changing the interrogative changes the answer.
+        if not interrogatives(original).issubset(interrogatives(candidate)): return False
         return entity_signature(original).issubset(entity_signature(candidate))
 
     def sequence_logprob(self, question, sampled, max_input=96, max_new=64):
@@ -122,9 +127,47 @@ class Reformulator:
         # `generate` returns decoder-start followed by sampled target IDs. Its start
         # token is omitted here; teacher forcing adds it via the model's shift-right.
         labels=torch.tensor([token_ids],dtype=torch.long,device=self.device)
-        out=self.model(**src,labels=labels)
+        # Score under the same (dropout-free) policy that generated the actions.
+        was_training=self.model.training
+        self.model.eval()
+        try:
+            out=self.model(**src,labels=labels)
+        finally:
+            self.model.train(was_training)
         logp=torch.log_softmax(out.logits,dim=-1)
         selected=logp.gather(-1,labels.unsqueeze(-1)).squeeze(-1)
         return selected.sum()
+
+    def sequence_logprob_ids_batch(self, question, token_ids_list, max_input=96):
+        """Teacher-force several sampled actions for one question in one pass.
+
+        Returns a tensor of shape (len(token_ids_list),) with the summed
+        log-probability of each sampled token sequence. Batching this step is the
+        main training speedup: it replaces one full encoder-decoder forward per
+        candidate with a single forward over all candidates.
+        """
+        if not token_ids_list:
+            raise ValueError("At least one sampled reformulation is required")
+        src=self._source(question,max_input)
+        batch=len(token_ids_list)
+        src={key:value.expand(batch,-1) for key,value in src.items()}
+        max_len=max(len(ids) for ids in token_ids_list)
+        labels=torch.full((batch,max_len),-100,dtype=torch.long,device=self.device)
+        mask=torch.zeros((batch,max_len),dtype=torch.bool,device=self.device)
+        for i,ids in enumerate(token_ids_list):
+            if not ids:
+                raise ValueError("A sampled reformulation must contain at least one token")
+            labels[i,:len(ids)]=torch.tensor(ids,dtype=torch.long,device=self.device)
+            mask[i,:len(ids)]=True
+        # Score under the same (dropout-free) policy that generated the actions.
+        was_training=self.model.training
+        self.model.eval()
+        try:
+            out=self.model(**src,labels=labels)
+        finally:
+            self.model.train(was_training)
+        logp=torch.log_softmax(out.logits,dim=-1)
+        selected=logp.gather(-1,labels.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+        return (selected*mask).sum(dim=1)
 
     def save_adapter(self,path): self.model.save_pretrained(path)

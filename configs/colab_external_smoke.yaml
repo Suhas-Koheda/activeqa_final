@@ -16,10 +16,10 @@ models:
   reformulator: ai4bharat/MultiIndicParaphraseGenerationSS
   qa: l3cube-pune/telugu-question-answering-squad-bert
   cache_dir: models
-  lora_rank: 4
-  lora_alpha: 8
+  lora_rank: 16
+  lora_alpha: 32
 generation:
-  candidates_per_question: 2
+  candidates_per_question: 4
   max_input_tokens: 96
   max_new_tokens: 64
   do_sample: true
@@ -28,9 +28,12 @@ retrieval:
   max_context_chars: 1200
 training:
   epochs: 1
-  learning_rate: 0.00001
+  learning_rate: 0.0001
+  batch_questions: 4
   gradient_clip_norm: 1.0
-  checkpoint_every_steps: 10
-  baseline_momentum: 0.9
+  checkpoint_every_steps: 2
   checkpoint: outputs/external_smoke_policy.pt
+evaluation:
+  do_sample: true
+  retrieval_metrics: true
 outputs: outputs
