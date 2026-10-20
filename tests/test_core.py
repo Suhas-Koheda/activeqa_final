@@ -78,7 +78,8 @@ def test_evaluation_candidate_choice_does_not_use_gold_answers(tmp_path):
     class FakeQA:
         def answer_with_score(self, question, context):
             answer = "gold answer" if question == "low confidence" else "wrong answer"
-            score = -0.2 if question == "high confidence" else -2.0
+            score = {"question": -3.0, "high confidence": -0.2,
+                     "low confidence": -2.0}[question]
             return answer, 0.0, score
 
         def answer(self, question, context):
@@ -101,6 +102,15 @@ def test_evaluation_candidate_choice_does_not_use_gold_answers(tmp_path):
     assert row["qa_selected_question"] == "high confidence"
     assert row["oracle_question"] == "low confidence"
     assert result["context_protocol"].startswith("primary metrics use")
+
+
+def test_qa_selector_can_abstain_to_original_question():
+    class FakeQA:
+        def answer_with_score(self, question, context):
+            return "answer", 0.0, {"original": -0.1, "bad reformulation": -1.2}[question]
+
+    assert select_qa_score(["original", "bad reformulation"], FakeQA(),
+                           [{"context": "context"}]) == "original"
 
 
 def test_flatten_squad_style_indicqa_json():

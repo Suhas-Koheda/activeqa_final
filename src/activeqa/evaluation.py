@@ -54,6 +54,7 @@ def evaluate(rows, reformulator, qa, retriever, cfg, outfile):
             False,
         )
         candidates = [action["candidate"] for action in actions] or [question]
+        selection_candidates = list(dict.fromkeys([question, *candidates]))
 
         # The paragraph attached to this question is its canonical supporting
         # context. All primary QA comparisons use exactly this same context.
@@ -66,9 +67,9 @@ def evaluate(rows, reformulator, qa, retriever, cfg, outfile):
         original_answer, original_confidence, _ = answer_best(question, canonical)
         pretrained_question = candidates[0]
         pretrained_answer, pretrained_confidence, _ = answer_best(pretrained_question, canonical)
-        qa_selected_question = select_qa_score(candidates, qa, canonical, record_qa_time)
+        qa_selected_question = select_qa_score(selection_candidates, qa, canonical, record_qa_time)
         qa_selected_answer, qa_selected_confidence, _ = answer_best(qa_selected_question, canonical)
-        oracle_question = select_oracle(candidates, qa, canonical, row["answers"], record_qa_time)
+        oracle_question = select_oracle(selection_candidates, qa, canonical, row["answers"], record_qa_time)
         oracle_answer, _, _ = answer_best(oracle_question, canonical)
 
         chosen = {
@@ -101,9 +102,9 @@ def evaluate(rows, reformulator, qa, retriever, cfg, outfile):
         if retrieved:
             retrieval_original, retrieval_original_confidence, retrieval_original_id = answer_best(question, retrieved)
             retrieval_pretrained, _, retrieval_pretrained_id = answer_best(pretrained_question, retrieved)
-            retrieval_question = select_qa_score(candidates, qa, retrieved, record_qa_time)
+            retrieval_question = select_qa_score(selection_candidates, qa, retrieved, record_qa_time)
             retrieval_selected, _, retrieval_selected_id = answer_best(retrieval_question, retrieved)
-            retrieval_oracle_question = select_oracle(candidates, qa, retrieved, row["answers"], record_qa_time)
+            retrieval_oracle_question = select_oracle(selection_candidates, qa, retrieved, row["answers"], record_qa_time)
             retrieval_oracle, _, retrieval_oracle_id = answer_best(retrieval_oracle_question, retrieved)
             retrieved_answers = {
                 "original": retrieval_original,
