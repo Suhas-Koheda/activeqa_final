@@ -20,12 +20,12 @@ def main():
     args = parser.parse_args()
     cfg = load_config(args.config)
     setup_cpu(cfg["seed"], cfg["cpu_threads"], cfg.get("device", "cpu"))
-    train, heldout = load_splits(cfg["data"])
+    train, heldout, retrieval_corpus = load_splits(cfg["data"], include_full_train=True)
     ref = Reformulator(cfg["models"]["reformulator"], cfg["models"]["cache_dir"],
                        cfg["models"]["lora_rank"], cfg["models"]["lora_alpha"],
                        device=cfg.get("device", "cpu"))
     qa = TeluguQA(cfg["models"]["qa"], cfg["models"]["cache_dir"], device=cfg.get("device", "cpu"))
-    retriever = Retriever(train)
+    retriever = Retriever(retrieval_corpus)
 
     baseline_path = "outputs/eval_pretrained.json"
     torch.manual_seed(cfg["seed"])

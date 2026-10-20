@@ -21,7 +21,7 @@ def _load_indicqa_json(path):
                                   "answers":{"text":[a.get("text", "") for a in qa.get("answers", [])]}}))
     return rows
 
-def load_splits(cfg):
+def load_splits(cfg, include_full_train=False):
     """Load only Telugu IndicQA test records; deterministically split for exploration.
 
     The upstream repository provides a legacy custom loading script, which Datasets 5.x
@@ -47,9 +47,11 @@ def load_splits(cfg):
     import random
     rng=random.Random(42); rng.shuffle(rows)
     n_eval=max(1, int(len(rows)*cfg.get("eval_fraction", .2)))
-    ev=rows[:n_eval]; tr=rows[n_eval:]
+    ev=rows[:n_eval]; full_train=rows[n_eval:]; tr=full_train
     if cfg.get("train_examples") is not None: tr=tr[:int(cfg["train_examples"])]
     if cfg.get("eval_examples") is not None: ev=ev[:int(cfg["eval_examples"])]
+    if include_full_train:
+        return tr,ev,full_train
     return tr,ev
 
 def save_splits(train, evaluation, out="outputs/split_manifest.json"):

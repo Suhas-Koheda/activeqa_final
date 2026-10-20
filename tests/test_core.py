@@ -107,7 +107,9 @@ def test_evaluation_candidate_choice_does_not_use_gold_answers(tmp_path):
 def test_qa_selector_can_abstain_to_original_question():
     class FakeQA:
         def answer_with_score(self, question, context):
-            return "answer", 0.0, {"original": -0.1, "bad reformulation": -1.2}[question]
+            answer = {"original": "Bose", "bad reformulation": "Gandhi"}[question]
+            score = {"original": -1.2, "bad reformulation": -0.1}[question]
+            return answer, 0.0, score
 
     assert select_qa_score(["original", "bad reformulation"], FakeQA(),
                            [{"context": "context"}]) == "original"
@@ -121,3 +123,26 @@ def test_flatten_squad_style_indicqa_json():
         rows=_load_indicqa_json(path)
         assert rows==[{"id":"te1","context":"మద్రాస్","question":"ఎక్కడ?","answers":["చెన్నై"]}]
     finally: os.unlink(path)
+
+
+def test_retrieval_can_use_full_disjoint_train_partition(monkeypatch, tmp_path):
+    from activeqa.data import load_splits
+    import huggingface_hub
+
+    rows = [{"id": str(i), "question": f"ప్రశ్న {i}", "context": f"సందర్భం {i}",
+             "answers": [{"text": f"సమాధానం {i}"}]} for i in range(10)]
+    payload = {"data": [{"paragraphs": [{"context": row["context"], "qas": [{
+        "id": row["id"], "question": row["question"], "answers": row["answers"]
+    }]} for row in rows]}]}
+    path = tmp_path / "indicqa.te.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **kwargs: str(path))
+
+    train, heldout, retrieval_corpus = load_splits({
+        "dataset": "fake", "config": "indicqa.te", "eval_fraction": 0.2,
+        "train_examples": 2, "eval_examples": 2,
+    }, include_full_train=True)
+    assert len(train) == 2
+    assert len(heldout) == 2
+    assert len(retrieval_corpus) == 8
+    assert {row["id"] for row in heldout}.isdisjoint(row["id"] for row in retrieval_corpus)

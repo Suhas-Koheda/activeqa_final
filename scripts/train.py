@@ -39,7 +39,7 @@ def main():
     args = parser.parse_args()
     cfg = load_config(args.config)
     setup_cpu(cfg["seed"], cfg["cpu_threads"], cfg.get("device", "cpu"))
-    train, evaluation = load_splits(cfg["data"])
+    train, evaluation, retrieval_corpus = load_splits(cfg["data"], include_full_train=True)
     save_splits(train, evaluation)
     requested = len(train) * cfg["training"]["epochs"] * cfg["generation"]["candidates_per_question"]
     print(f"device={cfg.get('device', 'cpu')} train={len(train)} heldout={len(evaluation)} sampled_actions={requested}; "
@@ -55,7 +55,8 @@ def main():
     qa = TeluguQA(cfg["models"]["qa"], cfg["models"]["cache_dir"], device=cfg.get("device", "cpu"))
     print(f"qa_load_seconds={time.perf_counter()-qa_started:.1f}", flush=True)
 
-    retriever = Retriever(train)
+    retriever = Retriever(retrieval_corpus)
+    print(f"retrieval_corpus_examples={len(retrieval_corpus)} (disjoint from heldout)", flush=True)
     optimizer = torch.optim.AdamW(ref.trainable, lr=cfg["training"]["learning_rate"])
     baseline = RunningBaseline(cfg["training"]["baseline_momentum"])
     step = 0
