@@ -17,7 +17,7 @@ models:
 generation:
   candidates_per_question: 2
   max_input_tokens: 96
-  max_new_tokens: 24
+  max_new_tokens: 64
   do_sample: true
 retrieval:
   top_k: 3

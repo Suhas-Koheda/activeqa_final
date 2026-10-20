@@ -43,11 +43,11 @@ class Reformulator:
         # generation does not accept them.
         return {key:value.to(self.device) for key,value in encoded.items() if key in {"input_ids","attention_mask"}}
 
-    def sample(self, question, n=2, max_input=96, max_new=24, do_sample=True):
+    def sample(self, question, n=2, max_input=96, max_new=64, do_sample=True):
         """Return display candidates, replacing invalid outputs with the input question."""
         return [x["candidate"] for x in self.sample_actions(question, n, max_input, max_new, do_sample)]
 
-    def sample_actions(self, question, n=2, max_input=96, max_new=24, do_sample=True):
+    def sample_actions(self, question, n=2, max_input=96, max_new=64, do_sample=True):
         """Sample policy actions while retaining the exact generated token IDs.
 
         Invalid text is exposed as the original question for downstream answer scoring,
@@ -71,23 +71,26 @@ class Reformulator:
         for ids in seq:
             text=normalize(self.tokenizer.decode(ids,skip_special_tokens=True,clean_up_tokenization_spaces=False))
             tokens=ids.tolist()
+            terminated = self.tokenizer.eos_token_id is not None and self.tokenizer.eos_token_id in tokens
             if tokens and tokens[0] == self.target_lang_id:
                 tokens=tokens[1:]
             if self.tokenizer.eos_token_id in tokens:
                 tokens=tokens[:tokens.index(self.tokenizer.eos_token_id)+1]
             else:
                 tokens=[x for x in tokens if x != self.tokenizer.pad_token_id]
-            valid=self._valid(question,text)
+            valid=self._valid(question,text,terminated=terminated)
             actions.append({"sampled_text":text,"candidate":text if valid else question,
-                            "valid":valid,"token_ids":tokens})
+                            "valid":valid,"terminated":terminated,"token_ids":tokens})
         return actions
 
-    def _valid(self, original, candidate):
+    def _valid(self, original, candidate, terminated=True):
+        # Reaching max_new_tokens without EOS usually means a mid-sentence cut.
+        if not terminated: return False
         if not candidate or len(candidate)>max(300,4*len(original)): return False
         if len(candidate)<2 or candidate==original: return False
         return entity_signature(original).issubset(entity_signature(candidate))
 
-    def sequence_logprob(self, question, sampled, max_input=96, max_new=24):
+    def sequence_logprob(self, question, sampled, max_input=96, max_new=64):
         """Teacher-force the exact generated action (string convenience wrapper)."""
         tgt=self.tokenizer(normalize(sampled),add_special_tokens=False,return_tensors="pt",truncation=True,max_length=max(1,max_new-1))
         ids=tgt.input_ids[0].tolist()

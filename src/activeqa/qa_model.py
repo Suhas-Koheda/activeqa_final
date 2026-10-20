@@ -32,6 +32,16 @@ class TeluguQA:
 
     @torch.inference_mode()
     def answer(self, question, context):
+        text, elapsed, _ = self.answer_with_score(question, context)
+        return text, elapsed
+
+    @torch.inference_mode()
+    def answer_with_score(self, question, context):
+        """Return answer text, elapsed seconds, and a context-span confidence score.
+
+        Confidence is the best start/end log-probability sum among legal context
+        spans. It is an inference-time ranking signal, not a calibrated probability.
+        """
         started = time.perf_counter()
         encoded = self.tok(
             question, context, return_tensors="pt", truncation="only_second",
@@ -58,15 +68,17 @@ class TeluguQA:
                 continue
             start_logits[~context_mask] = -1e9
             end_logits[~context_mask] = -1e9
-            starts = torch.topk(start_logits, k=min(20, len(start_logits))).indices.tolist()
-            ends = torch.topk(end_logits, k=min(20, len(end_logits))).indices.tolist()
+            start_logp = torch.log_softmax(start_logits, dim=-1)
+            end_logp = torch.log_softmax(end_logits, dim=-1)
+            starts = torch.topk(start_logp, k=min(20, len(start_logp))).indices.tolist()
+            ends = torch.topk(end_logp, k=min(20, len(end_logp))).indices.tolist()
             for start in starts:
                 for end in ends:
                     if end < start or end - start > 30:
                         continue
-                    score = float(start_logits[start] + end_logits[end])
+                    score = float(start_logp[start] + end_logp[end])
                     if score > best[0]:
                         char_start = int(offsets[batch_index, start, 0])
                         char_end = int(offsets[batch_index, end, 1])
                         best = (score, context[char_start:char_end].strip())
-        return best[1], time.perf_counter() - started
+        return best[1], time.perf_counter() - started, best[0]

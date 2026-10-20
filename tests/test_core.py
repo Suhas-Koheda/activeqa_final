@@ -6,6 +6,7 @@ from activeqa.policy_gradient import RunningBaseline
 from activeqa.policy_gradient import reinforce_step
 from activeqa.data import _load_indicqa_json
 from activeqa.qa_model import _context_token_mask
+from activeqa.selection import select_qa_score
 import json, tempfile, os
 
 def test_unicode_normalization_and_tokens():
@@ -46,6 +47,60 @@ def test_context_mask_matches_model_input_device():
         mask = _context_token_mask(encoded, inputs, 0, device)
         assert mask.device == device
         assert mask.tolist() == [False, False, True, True]
+
+
+def test_qa_score_selection_uses_confidence_not_nonempty_answers():
+    class FakeQA:
+        def answer_with_score(self, question, context):
+            return "some answer", 0.0, {"low confidence": -2.0, "high confidence": -0.2}[question]
+
+    chosen = select_qa_score(["low confidence", "high confidence"], FakeQA(),
+                             [{"context": "context"}])
+    assert chosen == "high confidence"
+
+
+def test_reformulator_rejects_generation_without_eos():
+    from activeqa.reformulator import Reformulator
+    reformulator = object.__new__(Reformulator)
+    assert not reformulator._valid("ప్రశ్న 2024", "ప్రశ్న 2024", terminated=False)
+
+
+def test_evaluation_candidate_choice_does_not_use_gold_answers(tmp_path):
+    from activeqa.evaluation import evaluate
+
+    class FakeReformulator:
+        def sample_actions(self, *args):
+            return [
+                {"sampled_text": "high confidence", "candidate": "high confidence", "valid": True},
+                {"sampled_text": "low confidence", "candidate": "low confidence", "valid": True},
+            ]
+
+    class FakeQA:
+        def answer_with_score(self, question, context):
+            answer = "gold answer" if question == "low confidence" else "wrong answer"
+            score = -0.2 if question == "high confidence" else -2.0
+            return answer, 0.0, score
+
+        def answer(self, question, context):
+            return self.answer_with_score(question, context)[:2]
+
+    class EmptyRetriever:
+        def retrieve(self, *args):
+            return []
+
+    config = {"generation": {"candidates_per_question": 2,
+                             "max_input_tokens": 96, "max_new_tokens": 64},
+              "retrieval": {"top_k": 3, "max_context_chars": 100}}
+    rows = [{"id": "1", "question": "question", "context": "supporting context",
+             "answers": ["gold answer"]}]
+    result = evaluate(rows, FakeReformulator(), FakeQA(), EmptyRetriever(), config,
+                      str(tmp_path / "eval.json"))
+    with open(tmp_path / "eval.json", encoding="utf-8") as stream:
+        saved = json.load(stream)
+    row = saved["predictions"][0]
+    assert row["qa_selected_question"] == "high confidence"
+    assert row["oracle_question"] == "low confidence"
+    assert result["context_protocol"].startswith("primary metrics use")
 
 
 def test_flatten_squad_style_indicqa_json():
