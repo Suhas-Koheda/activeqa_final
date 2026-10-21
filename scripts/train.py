@@ -134,6 +134,7 @@ def main():
             print(f"could_not_load_previous_metrics={exc}", flush=True)
     pending = []  # REINFORCE: (logprob, advantage, reward); RFT: (logprob, best, original)
     rows_in_batch = 0
+    confidences = []  # span confidence per sampled rewrite (deployment alignment)
 
     def flush_batch(epoch):
         nonlocal update_step, peak_rss
@@ -199,28 +200,61 @@ def main():
             # Per-question baseline: reward of leaving the question untouched.
             original_reward = reward(qa_answers[0][0], row["answers"],
                                      valid=True, preserve=1.0)
+            original_confidence = qa_answers[0][2]
             values = []
-            for action, (answer, _, _) in zip(sampled, qa_answers[1:]):
+            confidences.clear()
+            for action, (answer, _, confidence) in zip(sampled, qa_answers[1:]):
                 preserves_entities = entity_signature(row["question"]).issubset(
                     entity_signature(action["sampled_text"]))
                 # reward() already applies the entity bonus and invalid penalty.
                 values.append(reward(answer, row["answers"], valid=action["valid"],
                                      preserve=float(preserves_entities)))
+                confidences.append(confidence)
 
             if method == "rft":
                 question_step = action_step // candidates + 1
                 action_step += candidates
-                best_index = max(range(len(sampled)), key=values.__getitem__)
-                best_action = sampled[best_index]
-                best_reward = values[best_index]
-                selected = bool(best_action["valid"]) and best_reward >= original_reward + margin
+                # Deployment alignment: offline the reward is gold-labelled, but
+                # at test time the answer is chosen by span confidence among
+                # candidates whose extracted answer stays consistent. Teaching
+                # the policy rewrites that only look better under the gold
+                # label yet never win the confidence ranking produced the
+                # observed RFT gap, so require the rewrite to also win (or tie)
+                # the span-confidence contest against the original question.
+                best_index = max(
+                    (i for i in range(len(sampled))
+                     if sampled[i]["valid"]
+                     and values[i] >= original_reward + margin
+                     and confidences[i] >= original_confidence),
+                    key=lambda i: values[i], default=None)
+                diag_index = max(range(len(sampled)), key=values.__getitem__)
+                best_index = max(
+                    (i for i in range(len(sampled))
+                     if sampled[i]["valid"]
+                     and values[i] >= original_reward + margin
+                     and confidences[i] >= original_confidence),
+                    key=lambda i: values[i], default=None)
+                best_action = sampled[diag_index]
+                best_reward = values[diag_index]
+                best_confidence = confidences[diag_index]
+                selected = False
+                if best_index is not None:
+                    # Gradient target uses the deployment-aligned winner.
+                    best_action = sampled[best_index]
+                    best_reward = values[best_index]
+                    best_confidence = confidences[best_index]
+                    selected = True
+
                 action_log.append({
                     "epoch": epoch + 1,
                     "question_step": question_step,
                     "original_reward": original_reward,
                     "best_reward": best_reward,
                     "best_index": best_index,
+                    "diag_index": diag_index,
                     "selected": selected,
+                    "best_confidence": best_confidence,
+                    "original_confidence": original_confidence,
                     "valid": best_action["valid"],
                     "candidate_rewards": values,
                     "candidate_validity": [a["valid"] for a in sampled],

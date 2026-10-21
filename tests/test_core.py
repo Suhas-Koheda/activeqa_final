@@ -49,6 +49,38 @@ def test_context_mask_matches_model_input_device():
         assert mask.tolist() == [False, False, True, True]
 
 
+def test_majority_vote_prefers_repeated_answer_over_original():
+    from activeqa.selection import select_majority_vote
+
+    # One rewrite yields the (hypothetically better) answer that three of the
+    # four sampled rewrites agree on; the lone-vote answer stays rejected.
+    class FakeQA:
+        def answer_with_score(self, question, context):
+            answer = {"original": "A", "c1": "B", "c2": "B", "c3": "B",
+                      "c4": "C"}[question]
+            score = {"original": -1.0, "c1": -2.0, "c2": -2.0, "c3": -2.0,
+                     "c4": -0.1}[question]
+            return answer, 0.0, score
+
+    chosen = select_majority_vote(["original", "c1", "c2", "c3", "c4"],
+                                  FakeQA(), [{"context": "ctx"}])
+    assert chosen in ("c1", "c2", "c3")
+
+
+def test_majority_vote_keeps_original_when_answers_diverge():
+    from activeqa.selection import select_majority_vote
+
+    class FakeQA:
+        def answer_with_score(self, question, context):
+            answer = {"original": "A", "c1": "B", "c2": "C", "c3": "D",
+                      "c4": "E"}[question]
+            return answer, 0.0, {"original": -1.0}.get(question, -0.1)
+
+    chosen = select_majority_vote(["original", "c1", "c2", "c3", "c4"],
+                                  FakeQA(), [{"context": "ctx"}])
+    assert chosen == "original"
+
+
 def test_qa_score_selection_uses_confidence_not_nonempty_answers():
     class FakeQA:
         def answer_with_score(self, question, context):

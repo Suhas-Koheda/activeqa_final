@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from .preprocessing import entity_signature
 from .rewards import reward, token_f1
-from .selection import select_oracle, select_qa_score
+from .selection import select_majority_vote, select_oracle, select_qa_score
 
 
 def evaluate(rows, reformulator, qa, retriever, cfg, outfile, label="eval"):
@@ -25,6 +25,13 @@ def evaluate(rows, reformulator, qa, retriever, cfg, outfile, label="eval"):
     started = time.perf_counter()
     do_sample = bool(cfg.get("evaluation", {}).get("do_sample", True))
     include_retrieval = bool(cfg.get("evaluation", {}).get("retrieval_metrics", True))
+    selection_mode = str(cfg.get("evaluation", {}).get("selection", "confidence"))
+
+    def select_candidate(cands, contexts, record_time):
+        if selection_mode == "majority":
+            return select_majority_vote(cands, qa, contexts, record_time)
+        return select_qa_score(cands, qa, contexts, record_time)
+
     predictions = []
     methods = ("original", "pretrained", "qa_selected", "oracle")
     scores = {name: [] for name in methods}
@@ -74,7 +81,7 @@ def evaluate(rows, reformulator, qa, retriever, cfg, outfile, label="eval"):
         original_answer, original_confidence, _ = answer_best(question, canonical)
         pretrained_question = candidates[0]
         pretrained_answer, pretrained_confidence, _ = answer_best(pretrained_question, canonical)
-        qa_selected_question = select_qa_score(selection_candidates, qa, canonical, record_qa_time)
+        qa_selected_question = select_candidate(selection_candidates, canonical, record_qa_time)
         qa_selected_answer, qa_selected_confidence, _ = answer_best(qa_selected_question, canonical)
         oracle_question = select_oracle(selection_candidates, qa, canonical, row["answers"], record_qa_time)
         oracle_answer, _, _ = answer_best(oracle_question, canonical)
@@ -116,7 +123,7 @@ def evaluate(rows, reformulator, qa, retriever, cfg, outfile, label="eval"):
         if include_retrieval and retrieved:
             retrieval_original, retrieval_original_confidence, retrieval_original_id = answer_best(question, retrieved)
             retrieval_pretrained, _, retrieval_pretrained_id = answer_best(pretrained_question, retrieved)
-            retrieval_question = select_qa_score(selection_candidates, qa, retrieved, record_qa_time)
+            retrieval_question = select_candidate(selection_candidates, retrieved, record_qa_time)
             retrieval_selected, _, retrieval_selected_id = answer_best(retrieval_question, retrieved)
             retrieval_oracle_question = select_oracle(selection_candidates, qa, retrieved, row["answers"], record_qa_time)
             retrieval_oracle, _, retrieval_oracle_id = answer_best(retrieval_oracle_question, retrieved)
@@ -166,6 +173,7 @@ def evaluate(rows, reformulator, qa, retriever, cfg, outfile, label="eval"):
         "examples": len(rows),
         "context_protocol": "primary metrics use each example's canonical supporting context",
         "decoding": "sampled" if do_sample else "beam",
+        "selection": selection_mode,
         "metrics": {
             name: {
                 "exact_match": sum(score == 1.0 for score in values) / max(1, len(values)),

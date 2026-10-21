@@ -19,7 +19,7 @@ models:
   lora_rank: 8
   lora_alpha: 16
 generation:
-  candidates_per_question: 4
+  candidates_per_question: 8
   max_input_tokens: 96
   max_new_tokens: 64
   do_sample: true
@@ -37,6 +37,8 @@ training:
   checkpoint_every_steps: 2
   checkpoint: outputs/external_rft_smoke_policy.pt
 evaluation:
+  # Self-consistency vote among original + sampled rewrites.
+  selection: majority
   do_sample: true
   retrieval_metrics: true
 outputs: outputs
