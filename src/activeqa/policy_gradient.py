@@ -23,6 +23,32 @@ def reinforce_step(logprob,reward_value,baseline,optimizer,params,clip=1.0):
     return float(loss.detach()),adv
 
 
+def sft_batch_step(logprobs, optimizer, params, clip=1.0):
+    """Teacher-forcing update on selected high-reward sequences.
+
+    Used by rejection-sampling fine-tuning: only sequences that were sampled,
+    validated, and scored at least as well as the original question are passed
+    here. The loss increases their likelihood, so a batch with no good sample
+    is skipped instead of pushing every sampled action down as REINFORCE would.
+    """
+    import torch
+    if not logprobs:
+        raise ValueError("At least one target sequence is required")
+    loss = -torch.stack(logprobs).mean()
+    if not torch.isfinite(loss):
+        raise FloatingPointError("non-finite SFT loss")
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    grads = [p.grad for p in params if p.grad is not None]
+    if not grads:
+        raise RuntimeError("SFT produced no trainable gradients")
+    if not all(torch.isfinite(g).all() for g in grads):
+        raise FloatingPointError("non-finite SFT gradient")
+    torch.nn.utils.clip_grad_norm_(params, clip)
+    optimizer.step()
+    return float(loss.detach())
+
+
 def reinforce_batch_step(logprobs, advantages, optimizer, params, clip=1.0):
     """One REINFORCE update over a batch of sampled actions.
 

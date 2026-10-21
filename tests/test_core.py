@@ -3,7 +3,7 @@ sys.path.insert(0,'src')
 from activeqa.preprocessing import normalize,tokens,entity_signature,interrogatives
 from activeqa.rewards import token_f1,reward
 from activeqa.policy_gradient import RunningBaseline
-from activeqa.policy_gradient import reinforce_step,reinforce_batch_step
+from activeqa.policy_gradient import reinforce_step,reinforce_batch_step,sft_batch_step
 from activeqa.data import _load_indicqa_json
 from activeqa.qa_model import _context_token_mask
 from activeqa.selection import select_qa_score
@@ -76,6 +76,18 @@ def test_reformulator_rejects_question_type_change():
     reformulator = object.__new__(Reformulator)
     assert not reformulator._valid("ఇది ఎక్కడ ఉంది?", "ఇది ఎందుకు ఉంది?")
     assert reformulator._valid("ఇది ఎక్కడ ఉంది?", "ఇది ఎక్కడ ఉంటుంది?")
+
+
+def test_sft_batch_step_updates_trainable_parameter():
+    import torch
+    policy = torch.nn.Parameter(torch.tensor([0.1, 0.2]))
+    optimizer = torch.optim.SGD([policy], lr=0.1)
+    old = policy.detach().clone()
+    loss = sft_batch_step([torch.log(policy[0]), torch.log(policy[1])],
+                          optimizer, [policy], clip=1.0)
+    assert loss == loss  # finite
+    assert policy.grad is not None
+    assert not torch.equal(old, policy.detach())
 
 
 def test_reinforce_batch_step_updates_trainable_parameter():

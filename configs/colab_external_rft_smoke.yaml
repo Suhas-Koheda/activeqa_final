@@ -1,0 +1,42 @@
+# Leakage-safe RFT smoke run: validates the rejection-sampling loop quickly.
+device: cuda
+seed: 42
+cpu_threads: 4
+data:
+  dataset: ai4bharat/IndicQA
+  config: indicqa.te
+  cache_dir: data/cache
+  external_train_dataset: nlpctx/activeqa-telugu-rl-data
+  external_train_file: data/indic_rag_te/train.jsonl
+  external_dev_file: data/indic_rag_te/dev.jsonl
+  train_examples: 16
+  eval_examples: 8
+  eval_fraction: 0.2
+models:
+  reformulator: ai4bharat/MultiIndicParaphraseGenerationSS
+  qa: l3cube-pune/telugu-question-answering-squad-bert
+  cache_dir: models
+  lora_rank: 8
+  lora_alpha: 16
+generation:
+  candidates_per_question: 4
+  max_input_tokens: 96
+  max_new_tokens: 64
+  do_sample: true
+retrieval:
+  top_k: 3
+  max_context_chars: 1200
+training:
+  method: rft
+  epochs: 1
+  learning_rate: 0.00005
+  batch_questions: 4
+  min_reward_margin: 0.0
+  gradient_clip_norm: 1.0
+  keep_step_checkpoints: true
+  checkpoint_every_steps: 2
+  checkpoint: outputs/external_rft_smoke_policy.pt
+evaluation:
+  do_sample: true
+  retrieval_metrics: true
+outputs: outputs
