@@ -24,7 +24,7 @@ models:
   lora_rank: 16
   lora_alpha: 32
 generation:
-  candidates_per_question: 2
+  candidates_per_question: 3
   max_input_tokens: 96
   max_new_tokens: 64
   do_sample: true
@@ -32,7 +32,8 @@ retrieval:
   top_k: 3
   max_context_chars: 1200
 training:
-  sft_warmup: true
+  # Do not imitate the weak, rule-based silver targets during smoke training.
+  sft_warmup: false
   sft_warmup_epochs: 1
   sft_learning_rate: 0.000005
   sft_checkpoint_every_steps: 4

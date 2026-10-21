@@ -23,7 +23,9 @@ models:
   lora_rank: 16
   lora_alpha: 32
 generation:
-  candidates_per_question: 4
+  # Three independently sampled alternatives per source question, as in a
+  # candidate-generation ActiveQA loop.
+  candidates_per_question: 3
   max_input_tokens: 96
   max_new_tokens: 64
   do_sample: true
@@ -31,9 +33,9 @@ retrieval:
   top_k: 3
   max_context_chars: 1200
 training:
-  # Teacher-forced warm-up uses the uploaded rule-based pairs, then true
-  # REINFORCE optimizes QA reward on the separate QA train split.
-  sft_warmup: true
+  # The available rule-based rewrite pairs are weak silver labels. Keep them
+  # out of policy training; optimize sampled alternatives from QA reward.
+  sft_warmup: false
   sft_warmup_epochs: 1
   sft_learning_rate: 0.000005
   sft_checkpoint_every_steps: 25
