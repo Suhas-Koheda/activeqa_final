@@ -10,6 +10,9 @@ data:
   external_train_dataset: nlpctx/activeqa-telugu-rl-data
   external_train_file: data/indic_rag_te/train.jsonl
   external_dev_file: data/indic_rag_te/dev.jsonl
+  reformulation_dataset: nlpctx/activeqa-telugu-rl-data
+  reformulation_train_file: data/indic_rag_te/rule_reformulations/train.jsonl
+  reformulation_dev_file: data/indic_rag_te/rule_reformulations/dev.jsonl
   train_examples: null
   eval_examples: null
   eval_fraction: 0.2
@@ -28,6 +31,13 @@ retrieval:
   top_k: 3
   max_context_chars: 1200
 training:
+  # Teacher-forced warm-up uses the uploaded rule-based pairs, then true
+  # REINFORCE optimizes QA reward on the separate QA train split.
+  sft_warmup: true
+  sft_warmup_epochs: 1
+  sft_learning_rate: 0.000005
+  sft_checkpoint_every_steps: 25
+  sft_checkpoint: outputs/external_rl_sft_policy.pt
   # Actual policy-gradient training: sampled reformulations receive REINFORCE
   # updates from downstream answer reward relative to the original question.
   method: reinforce
@@ -40,6 +50,7 @@ training:
 evaluation:
   # Match the stochastic policy used in training instead of beam search.
   do_sample: true
+  reformulation_pair_do_sample: false
   # Reference-free QA confidence with the original question as fallback.
   selection: confidence
   # BM25 diagnostics are ~75% of evaluation QA calls and score ~0.006 F1.

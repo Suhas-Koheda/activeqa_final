@@ -64,6 +64,72 @@ def _resolve_external_jsonl(source, split, cache_dir=None):
                            repo_type="dataset", cache_dir=cache_dir)
 
 
+def _resolve_dataset_file(source, filename, fallback, cache_dir=None):
+    """Resolve a nested file in a dataset repo, preferring an existing local copy."""
+    path = Path(str(fallback)).expanduser() if fallback else None
+    if path is not None and path.is_file():
+        return str(path)
+    if not source or not _looks_like_hf_dataset(source):
+        raise FileNotFoundError(f"Dataset file not found: {fallback or filename}")
+    from huggingface_hub import hf_hub_download
+    return hf_hub_download(repo_id=str(source), filename=filename,
+                           repo_type="dataset", cache_dir=cache_dir)
+
+
+def _load_reformulation_jsonl(path):
+    """Read the uploaded rule_reformulations split as question/target pairs."""
+    rows = []
+    with open(path, encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            question = normalize(item.get("question"))
+            target = normalize(item.get("reformulation") or item.get("candidate"))
+            if not question or not target or question == target:
+                continue
+            rows.append({
+                "id": str(item.get("id", len(rows))),
+                "question": question,
+                "reformulation": target,
+                "context": normalize(item.get("context")),
+                "answers": [normalize(x) for x in (item.get("answers") or []) if normalize(x)],
+                "wiki_id": str(item.get("wiki_id", "")),
+                "label_status": str(item.get("label_status", "silver_rule_based_requires_telugu_review")),
+            })
+    return rows
+
+
+def load_reformulation_splits(cfg):
+    """Load distinct train/dev rewrite pairs from the configured HF dataset repo."""
+    repo = cfg.get("reformulation_dataset") or cfg.get("external_train_dataset")
+    cache_dir = cfg.get("cache_dir")
+    train_file = _resolve_dataset_file(
+        repo, "rule_reformulations/train.jsonl",
+        cfg.get("reformulation_train_file", "data/indic_rag_te/rule_reformulations/train.jsonl"),
+        cache_dir,
+    )
+    dev_file = _resolve_dataset_file(
+        repo, "rule_reformulations/dev.jsonl",
+        cfg.get("reformulation_dev_file", "data/indic_rag_te/rule_reformulations/dev.jsonl"),
+        cache_dir,
+    )
+    train = _load_reformulation_jsonl(train_file)
+    dev = _load_reformulation_jsonl(dev_file)
+    if cfg.get("reformulation_train_examples") is not None:
+        train = train[:int(cfg["reformulation_train_examples"])]
+    if cfg.get("reformulation_dev_examples") is not None:
+        dev = dev[:int(cfg["reformulation_dev_examples"])]
+    train_articles = {r["wiki_id"] for r in train if r["wiki_id"]}
+    dev_articles = {r["wiki_id"] for r in dev if r["wiki_id"]}
+    overlap = train_articles & dev_articles
+    if overlap:
+        raise ValueError(f"Reformulation train/dev article leakage: {len(overlap)} wiki_id values")
+    print(f"reformulation_train_source={train_file} rows={len(train)}; "
+          f"reformulation_dev_source={dev_file} rows={len(dev)}; article_overlap=0")
+    return train, dev
+
+
 def load_splits(cfg, include_full_train=False):
     """Load external Telugu training rows and a disjoint IndicQA test evaluation.
 

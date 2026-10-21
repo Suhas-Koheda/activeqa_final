@@ -12,25 +12,20 @@ size_categories:
 
 # ActiveQA Telugu RL Sample
 
-This repository contains a small, reproducible Telugu question-answering sample intended for reinforcement-learning experiments on question reformulation.
+A Telugu QA sample for reward-based question reformulation experiments.
 
 ## Files
 
 - `train.jsonl`: 804 Telugu question, context, and answer records.
-- `dev.jsonl`: 200 corresponding records, split by Wikipedia article from the training set.
-- `reformulations_review.jsonl`: 100 OpenCode MiniMax-generated candidate rewrites of training questions. These are draft annotations and require human review; they are not validated semantic-equivalence labels.
-- `metadata.json`: source, sampling, filtering, seed, and split information.
+- `dev.jsonl`: 200 QA records split by Wikipedia article from training.
+- `reformulations_review.jsonl`: 300 rule-based rewrite candidates (242 train, 58 dev); no language model generated these examples. All are marked for Telugu-speaker review.
+- `rule_reformulations/train.jsonl` and `rule_reformulations/dev.jsonl`: split-specific rewrite records.
+- `metadata.json`: source, sampling, filtering, and split information.
 
-The JSONL QA schema uses `id`, `question`, `context`, `answers` (list), `title`, `wiki_id`, `url`, and source provenance fields. The reformulation file additionally contains `candidate`, `generator`, and `needs_manual_review`.
+Reformulations use conservative substitutions for common question phrases such as `ఎక్కడ` / `ఏ ప్రదేశంలో`, `ఎప్పుడు` / `ఏ సమయంలో`, and `ఏ విధంగా` / `ఎలా`. Every rewrite retains the source question, context, answer, article ID, and split. The rewrites are silver labels: semantic equivalence has not been independently verified. Review them with a fluent Telugu speaker before using them as supervised labels.
 
-## Source and construction
+## QA data source
 
-The QA examples were sampled from the Telugu (`te`) training config of [AI4Bharat Indic-Rag-Suite](https://huggingface.co/datasets/ai4bharat/Indic-Rag-Suite), which is derived from Telugu Wikipedia and whose records attribute QA generation to Meta-Llama-3.3-70B-Instruct. The source card declares MIT. Sampling is deterministic (seed 42); identical QA/context rows are removed; answer strings must occur in the context after Unicode punctuation/spacing normalization; contexts shorter than 100 characters are excluded; and complete `wiki_id` groups are assigned to a single split. The resulting train/dev article overlap is zero.
+QA examples were sampled from the Telugu (`te`) training config of [AI4Bharat Indic-Rag-Suite](https://huggingface.co/datasets/ai4bharat/Indic-Rag-Suite), derived from Telugu Wikipedia. The source records attribute QA generation to Meta-Llama-3.3-70B-Instruct. The source card declares MIT. Rows with missing values were removed, answer strings were required to occur in context after Unicode normalization, and train/dev article overlap is zero. These checks do not establish answer correctness.
 
-The generated sample was also checked against the locally cached IndicQA Telugu evaluation contexts; no exact context duplicates were found. At runtime, the project drops any exact context duplicates it encounters between external training data and the selected IndicQA evaluation set.
-
-The candidate rewrites were generated with the free OpenCode model `opencode/minimax-m3.1-flash-free`. Automatic checks cover nonempty output and ASCII-number preservation only. No semantic-preservation claim is made. Review candidates before training on them or reporting their quality.
-
-## Limitations
-
-Both the source QA examples and generated candidates are synthetic/automatically constructed. The answer-in-context filter is not a factuality check. The dataset is suitable for a pilot pipeline and reward-function debugging, not for claiming benchmark improvement. The associated IndicQA test set must remain evaluation-only.
+The IndicQA Telugu test split remains evaluation-only; exact context duplicates are removed at runtime. This is a pilot dataset, not evidence of improved Telugu question answering.

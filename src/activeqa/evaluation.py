@@ -13,6 +13,73 @@ from .rewards import reward, token_f1
 from .selection import select_majority_vote, select_oracle, select_qa_score, select_ranker
 
 
+def evaluate_reformulation_pairs(rows, reformulator, qa, cfg, outfile, label="rewrite_pairs"):
+    """Evaluate on held-out rule-pair rows; references never choose a prediction."""
+    started = time.perf_counter()
+    proc = psutil.Process()
+    peak_rss = proc.memory_info().rss
+    exact = f1s = valid = harmful = 0
+    original_qa_f1 = generated_qa_f1 = target_qa_f1 = 0.0
+    qa_seconds = 0.0
+    predictions = []
+    max_input = int(cfg["generation"]["max_input_tokens"])
+    max_new = int(cfg["generation"]["max_new_tokens"])
+    for row in tqdm(rows, desc=label, unit="pair", dynamic_ncols=True):
+        action = reformulator.sample_actions(row["question"], 1, max_input, max_new,
+                                             bool(cfg.get("evaluation", {}).get(
+                                                 "reformulation_pair_do_sample", False)))[0]
+        prediction = action["sampled_text"]
+        target = row["reformulation"]
+        exact += int(" ".join(prediction.split()) == " ".join(target.split()))
+        pair_f1 = token_f1(prediction, [target])
+        f1s += pair_f1
+
+        answers = qa.answer_batch([row["question"], prediction, target], row["context"])
+        qa_seconds += answers[0][1] if answers else 0.0
+        source_f1 = token_f1(answers[0][0], row["answers"])
+        prediction_f1 = token_f1(answers[1][0], row["answers"])
+        target_f1 = token_f1(answers[2][0], row["answers"])
+        original_qa_f1 += source_f1
+        generated_qa_f1 += prediction_f1
+        target_qa_f1 += target_f1
+        valid += int(action["valid"])
+        harmful += int(prediction_f1 < source_f1)
+        predictions.append({
+            "id": row["id"], "question": row["question"], "reference_reformulation": target,
+            "generated_reformulation": prediction, "valid": action["valid"],
+            "pair_token_f1": pair_f1, "answer_reference": row["answers"],
+            "original_answer": answers[0][0], "generated_answer": answers[1][0],
+            "target_rewrite_answer": answers[2][0],
+            "original_answer_f1": source_f1, "generated_answer_f1": prediction_f1,
+            "target_rewrite_answer_f1": target_f1,
+        })
+        peak_rss = max(peak_rss, proc.memory_info().rss)
+
+    n = max(1, len(rows))
+    metrics = {
+        "examples": len(rows),
+        "label_status": "silver rule-based rewrite references; not human verified",
+        "decoding": "sampled" if cfg.get("evaluation", {}).get("reformulation_pair_do_sample", False) else "greedy",
+        "rewrite_exact_match": exact / n,
+        "rewrite_token_f1": f1s / n,
+        "valid_generation_rate": valid / n,
+        "harmful_reformulation_rate": harmful / n,
+        "canonical_answer_f1": {
+            "original_question": original_qa_f1 / n,
+            "generated_rewrite": generated_qa_f1 / n,
+            "rule_reference_rewrite": target_qa_f1 / n,
+        },
+        "qa_seconds": round(qa_seconds, 2),
+        "wall_seconds": round(time.perf_counter() - started, 2),
+        "peak_rss_mb": round(peak_rss / 1e6, 1),
+    }
+    os.makedirs(os.path.dirname(outfile) or ".", exist_ok=True)
+    with open(outfile, "w", encoding="utf-8") as stream:
+        json.dump({"metrics": metrics, "predictions": predictions}, stream,
+                  ensure_ascii=False, indent=2)
+    return metrics
+
+
 def evaluate(rows, reformulator, qa, retriever, cfg, outfile, label="eval"):
     """Evaluate on canonical contexts; report retrieval-only results separately.
 

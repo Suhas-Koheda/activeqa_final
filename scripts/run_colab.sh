@@ -119,6 +119,17 @@ if [[ "$EVAL_ONLY" == "1" || "${COLAB_EVAL_ONLY:-0}" == "1" ]]; then
 else
   TRAIN_ARGS=(--config "$CONFIG_PATH")
   [[ "$RESUME" == "1" ]] && TRAIN_ARGS+=(--resume)
+  SFT_WARMUP="$(python - "$CONFIG_PATH" <<'PY'
+import sys, yaml
+with open(sys.argv[1], encoding="utf-8") as stream:
+    cfg = yaml.safe_load(stream)
+print(int(bool(cfg.get("training", {}).get("sft_warmup", False))))
+PY
+)"
+  if [[ "$SFT_WARMUP" == "1" ]]; then
+    run_stage "reformulation-pair SFT warm-up" python scripts/sft_warmup.py \
+      --config "$CONFIG_PATH" --resume
+  fi
   run_stage "policy training" python scripts/train.py "${TRAIN_ARGS[@]}"
   COLLECT_SELECTOR="$(python - "$CONFIG_PATH" <<'PY'
 import sys, yaml
@@ -141,6 +152,6 @@ fi
 
 echo
 echo "Run completed: $(date -Is)"
-echo "Metrics: outputs/train_metrics.json and outputs/eval_metrics.json"
-echo "Predictions: outputs/eval_pretrained.json and outputs/eval_trained.json"
+echo "Metrics: outputs/train_metrics.json, outputs/sft_warmup_metrics.json, and outputs/eval_metrics.json"
+echo "Predictions: outputs/eval_pretrained.json, outputs/eval_trained.json, and outputs/reformulations_pretrained.json / outputs/reformulations_trained.json"
 echo "Full log: $LOG_FILE"

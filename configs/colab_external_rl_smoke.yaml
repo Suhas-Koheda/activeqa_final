@@ -9,6 +9,11 @@ data:
   external_train_dataset: nlpctx/activeqa-telugu-rl-data
   external_train_file: data/indic_rag_te/train.jsonl
   external_dev_file: data/indic_rag_te/dev.jsonl
+  reformulation_dataset: nlpctx/activeqa-telugu-rl-data
+  reformulation_train_file: data/indic_rag_te/rule_reformulations/train.jsonl
+  reformulation_dev_file: data/indic_rag_te/rule_reformulations/dev.jsonl
+  reformulation_train_examples: 16
+  reformulation_dev_examples: 8
   train_examples: 16
   eval_examples: 8
   eval_fraction: 0.2
@@ -27,6 +32,11 @@ retrieval:
   top_k: 3
   max_context_chars: 1200
 training:
+  sft_warmup: true
+  sft_warmup_epochs: 1
+  sft_learning_rate: 0.000005
+  sft_checkpoint_every_steps: 4
+  sft_checkpoint: outputs/external_rl_smoke_sft_policy.pt
   method: reinforce
   epochs: 1
   learning_rate: 0.0001
@@ -36,5 +46,6 @@ training:
   checkpoint: outputs/external_rl_smoke_policy.pt
 evaluation:
   do_sample: true
+  reformulation_pair_do_sample: false
   retrieval_metrics: false
 outputs: outputs

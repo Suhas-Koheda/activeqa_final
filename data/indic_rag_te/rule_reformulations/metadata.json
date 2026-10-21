@@ -1,0 +1,22 @@
+{
+  "method": "fixed conservative Telugu interrogative phrase substitutions; no model calls",
+  "seed": null,
+  "train_rows": 242,
+  "dev_rows": 58,
+  "source_train": "data/indic_rag_te/train.jsonl",
+  "source_dev": "data/indic_rag_te/dev.jsonl",
+  "train_dev_article_overlap": 0,
+  "semantic_equivalence_verified": false,
+  "limitation": "Silver examples only. A fluent Telugu speaker must review every rewrite before supervised training.",
+  "rules": [
+    "where_from",
+    "where_from",
+    "where_to",
+    "year",
+    "where",
+    "when",
+    "why",
+    "kind",
+    "how"
+  ]
+}

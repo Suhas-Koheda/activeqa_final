@@ -18,5 +18,10 @@
   "minimum_context_characters": 100,
   "split_method": "seeded random-offset sampling, then article-grouped train/dev split",
   "limitation": "Synthetic QA from Telugu Wikipedia; sampled subset and automatic answer/context checks require human quality review.",
-  "created_unix": 1792518633
+  "created_unix": 1792518633,
+  "reformulation_method": "fixed Telugu question-phrase substitutions; no model or external generation service",
+  "reformulation_train_rows": 242,
+  "reformulation_dev_rows": 58,
+  "reformulation_semantic_equivalence_verified": false,
+  "reformulation_limitation": "Silver rule-based rewrite pairs; requires fluent Telugu review before policy/SFT training."
 }

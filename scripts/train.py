@@ -98,6 +98,20 @@ def main():
                        device=cfg.get("device", "cpu"))
     print(f"reformulator_load_seconds={time.perf_counter()-started:.1f}; "
           f"trainable_parameters={ref.trainable_count}", flush=True)
+    if bool(cfg["training"].get("sft_warmup", False)):
+        if not args.resume:
+            sft_checkpoint = cfg["training"].get(
+                "sft_checkpoint", "outputs/external_rl_sft_policy.pt")
+            if not os.path.isfile(sft_checkpoint):
+                raise FileNotFoundError(
+                    f"SFT warm-up checkpoint missing: {sft_checkpoint}. "
+                    "Run scripts/sft_warmup.py first.")
+            sft_saved = torch.load(sft_checkpoint, map_location="cpu", weights_only=False)
+            if sft_saved.get("base_model") != ref.base_name or not sft_saved.get("complete"):
+                raise ValueError("SFT warm-up checkpoint is incomplete or uses a different base model")
+            from peft import set_peft_model_state_dict
+            set_peft_model_state_dict(ref.model, sft_saved["adapter"])
+            print(f"loaded_reformulation_sft_warmup={sft_checkpoint}", flush=True)
     qa_started = time.perf_counter()
     qa = TeluguQA(cfg["models"]["qa"], cfg["models"]["cache_dir"], device=cfg.get("device", "cpu"))
     print(f"qa_load_seconds={time.perf_counter()-qa_started:.1f}", flush=True)
