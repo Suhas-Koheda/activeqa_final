@@ -1,5 +1,8 @@
 def run_question(question,ref,qa,retriever,cfg):
-    cs=ref.sample(question,cfg["generation"]["candidates_per_question"],cfg["generation"]["max_input_tokens"],cfg["generation"]["max_new_tokens"],False)
+    cs=ref.sample(question,cfg["generation"]["candidates_per_question"],
+                  cfg["generation"]["max_input_tokens"],
+                  cfg["generation"]["max_new_tokens"],
+                  bool(cfg["generation"].get("do_sample", True)))
     selection_candidates=list(dict.fromkeys([question,*cs]))
     passages=retriever.retrieve(question,cfg["retrieval"]["top_k"],max_chars=cfg["retrieval"]["max_context_chars"])
     if not passages: return {"question":question,"candidates":cs,"answer":"","contexts":[]}

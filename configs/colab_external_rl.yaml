@@ -28,8 +28,11 @@ retrieval:
   top_k: 3
   max_context_chars: 1200
 training:
-  epochs: 3
-  learning_rate: 0.0001
+  # Actual policy-gradient training: sampled reformulations receive REINFORCE
+  # updates from downstream answer reward relative to the original question.
+  method: reinforce
+  epochs: 2
+  learning_rate: 0.00001
   batch_questions: 8
   gradient_clip_norm: 1.0
   checkpoint_every_steps: 50
@@ -37,6 +40,8 @@ training:
 evaluation:
   # Match the stochastic policy used in training instead of beam search.
   do_sample: true
+  # Reference-free QA confidence with the original question as fallback.
+  selection: confidence
   # BM25 diagnostics are ~75% of evaluation QA calls and score ~0.006 F1.
   # Set true for the final reporting run if you want them.
   retrieval_metrics: false

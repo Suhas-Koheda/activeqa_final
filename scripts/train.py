@@ -6,12 +6,13 @@ Two objectives are supported:
     Sample several rewrites per question and update their log-probabilities with
     a per-question baseline. ``advantage = reward(rewrite) - reward(original)``.
 
-``rft`` (recommended for this task)
+``rft`` (optional supervised alternative)
     Rejection-sampling fine-tuning. Sample several rewrites, score them on the
     canonical passage, keep the best *valid* rewrite that is at least as good as
     the original question, and teacher-force that sequence. Batches with no good
     sample are skipped, so the policy is never pushed away from every sample at
-    once. This is much more stable than REINFORCE when the QA reward is sparse.
+    once. This can be more stable than REINFORCE when the QA reward is sparse,
+    but it is not a policy-gradient RL update.
 
 Both methods use the canonical supporting passage only, batch QA scoring across
 candidates, and write resumable LoRA checkpoints.

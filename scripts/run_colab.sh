@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
-CONFIG_PATH="configs/colab_external_collect.yaml"
+CONFIG_PATH="configs/colab_external_rl.yaml"
 CONFIG_SET=0
 EVAL_ONLY=0
 RESUME=0
@@ -12,14 +12,14 @@ while (($#)); do
   case "$1" in
     --eval-only) EVAL_ONLY=1 ;;
     --resume) RESUME=1 ;;
-    --smoke) CONFIG_PATH="configs/colab_external_rft_smoke.yaml"; CONFIG_SET=1 ;;
+    --smoke) CONFIG_PATH="configs/colab_external_rl_smoke.yaml"; CONFIG_SET=1 ;;
     --question)
       shift
       (($#)) || { echo "ERROR: --question needs Telugu question text" >&2; exit 2; }
       QUESTION="$1"
       ;;
     --help|-h)
-      echo "Usage: bash scripts/run_colab.sh [CONFIG] [--resume] [--eval-only] [--question TEXT]"
+      echo "Usage: bash scripts/run_colab.sh [CONFIG] [--smoke] [--resume] [--eval-only] [--question TEXT]"
       exit 0
       ;;
     --*) echo "ERROR: unknown option $1" >&2; exit 2 ;;

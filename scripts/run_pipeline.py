@@ -18,7 +18,7 @@ from activeqa.utils import load_config, setup_cpu
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--question", required=True, help="Telugu question to answer")
-    parser.add_argument("--config", default="configs/colab_external_collect.yaml")
+    parser.add_argument("--config", default="configs/colab_external_rl.yaml")
     parser.add_argument("--checkpoint", help="LoRA policy checkpoint (defaults to config)")
     parser.add_argument("--base-policy", action="store_true",
                         help="Skip loading the trained adapter")
