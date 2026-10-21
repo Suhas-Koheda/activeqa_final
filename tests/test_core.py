@@ -81,6 +81,97 @@ def test_majority_vote_keeps_original_when_answers_diverge():
     assert chosen == "original"
 
 
+def test_ranker_features_are_reference_free_and_sane():
+    import math
+    from activeqa.ranker import (FEATURE_NAMES, Ranker, candidate_features,
+                                 feature_vector, fill_answer_features)
+    question = "కులశేఖర పాండ్య రాజ్యం ఏ శతాబ్దంలో?"
+    pool_answers = ["6వ", "9వ"]
+    pool_confs = [-2.0, -1.0]
+
+    feats = candidate_features(
+        original_question=question, original_conf=-1.0,
+        candidate="పాండ్య రాజ్యం ఏ శతాబ్దం అభివృద్ధి చెందింది?",
+        answer="9వ", confidence=-1.0,
+        pool_answers=pool_answers, pool_confs=pool_confs)
+    fill_answer_features(feats, "9వ", "6వ", pool_answers)
+    vector = feature_vector(feats)
+    assert len(vector) == len(FEATURE_NAMES)
+    assert all(isinstance(x, float) and math.isfinite(x) for x in vector)
+    assert feats["conf_delta"] == 0.0
+    # the candidate owns the best confidence in the pool => top rank
+    assert feats["conf_rank_frac"] == 1.0
+    assert feats["same_answer"] == 0.0
+    assert abs(feats["vote_frac"] - 0.5) < 1e-9
+    assert feats["ends_with_question_mark"] == 1.0
+    assert 0.0 < feats["question_similarity"] < 1.0
+
+
+def test_select_ranker_switches_only_above_threshold():
+    from activeqa.ranker import FEATURE_NAMES, Ranker
+    from activeqa.selection import select_ranker
+
+    class FakeQA:
+        def answer_with_score(self, question, context):
+            table = {"orig": ("a", -0.6), "weak": ("a", -2.0), "strong": ("b", -0.5)}
+            answer, conf = table[question]
+            return answer, 0.0, conf
+
+    # Only conf_delta carries weight (positive slope).
+    weights = {"names": list(FEATURE_NAMES),
+               "coef": [1.0] + [0.0] * (len(FEATURE_NAMES) - 1),
+               "intercept": 0.0, "switch_threshold": 0.9}
+    ranker = Ranker(weights)
+
+    # strong: conf_delta=+0.1 -> p ~= 0.525, below the 0.9 gate -> keep original.
+    assert select_ranker(["orig", "strong"], FakeQA(), [{"context": "c"}], ranker) == "orig"
+    # Lower the gate and the confident rewrite wins.
+    ranker.threshold = 0.5
+    assert select_ranker(["orig", "strong"], FakeQA(), [{"context": "c"}], ranker) == "strong"
+    # weak rewrite (conf_delta=-1.4) never clears any positive threshold.
+    assert select_ranker(["orig", "weak"], FakeQA(), [{"context": "c"}], ranker) == "orig"
+
+
+def test_train_selector_calibrates_on_synthetic_pools(tmp_path):
+    import json
+    sys.path.insert(0, "scripts")
+    import train_selector
+
+    def build_record(i, better_conf):
+        # the candidate answers the gold answer only when its confidence is
+        # higher; the ranker must learn conf_delta as the deciding feature.
+        return {
+            "id": str(i), "epoch": 1,
+            "question": "q", "original_answer": "a", "original_confidence": -1.0,
+            "original_f1": 0.2,
+            "candidates": ["orig", "cand"],
+            "validity": [True, True],
+            "answers": ["a", "gold" if better_conf else "wrong"],
+            "confidences": [-1.0, -0.8 if better_conf else -1.2],
+            "f1s": [0.2, 0.9 if better_conf else 0.1],
+        }
+
+    records = [build_record(i, better_conf=(i % 2 == 0)) for i in range(60)]
+    dataset = tmp_path / "selector_dataset.jsonl"
+    with open(dataset, "w", encoding="utf-8") as stream:
+        for record in records:
+            stream.write(json.dumps(record) + "\n")
+
+    import train_selector
+    out = tmp_path / "weights.json"
+    sys_argv = sys.argv
+    sys.argv = ["train_selector.py", "--dataset", str(dataset),
+                "--out", str(out), "--splits", "3"]
+    try:
+        train_selector.main()
+    finally:
+        sys.argv = sys_argv
+    weights = json.load(open(out))
+    assert weights["switch_threshold"] > 0
+    conf_delta_index = weights["names"].index("conf_delta")
+    assert weights["coef"][conf_delta_index] > 0
+
+
 def test_qa_score_selection_uses_confidence_not_nonempty_answers():
     class FakeQA:
         def answer_with_score(self, question, context):

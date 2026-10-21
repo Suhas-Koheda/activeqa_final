@@ -79,14 +79,18 @@ run_stage() {
 }
 
 run_stage "prepare data split" python scripts/prepare_data.py --config "$CONFIG_PATH"
-run_stage "REINFORCE training" python scripts/train.py --config "$CONFIG_PATH"
 CHECKPOINT_PATH="$(python - "$CONFIG_PATH" <<'PY'
 import sys, yaml
 with open(sys.argv[1], encoding="utf-8") as stream:
     print(yaml.safe_load(stream)["training"]["checkpoint"])
 PY
 )"
-run_stage "paired evaluation" python scripts/evaluate.py --config "$CONFIG_PATH" --checkpoint "$CHECKPOINT_PATH"
+if [[ "${2:-}" == "--eval-only" || "${COLAB_EVAL_ONLY:-0}" == "1" ]]; then
+  run_stage "paired evaluation (eval-only)" python scripts/evaluate.py --config "$CONFIG_PATH" --checkpoint "$CHECKPOINT_PATH"
+else
+  run_stage "policy training" python scripts/train.py --config "$CONFIG_PATH"
+  run_stage "paired evaluation" python scripts/evaluate.py --config "$CONFIG_PATH" --checkpoint "$CHECKPOINT_PATH"
+fi
 
 echo
 echo "Run completed: $(date -Is)"

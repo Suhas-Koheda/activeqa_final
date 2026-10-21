@@ -8,8 +8,9 @@ import psutil
 from tqdm import tqdm
 
 from .preprocessing import entity_signature
+from .ranker import Ranker
 from .rewards import reward, token_f1
-from .selection import select_majority_vote, select_oracle, select_qa_score
+from .selection import select_majority_vote, select_oracle, select_qa_score, select_ranker
 
 
 def evaluate(rows, reformulator, qa, retriever, cfg, outfile, label="eval"):
@@ -26,10 +27,18 @@ def evaluate(rows, reformulator, qa, retriever, cfg, outfile, label="eval"):
     do_sample = bool(cfg.get("evaluation", {}).get("do_sample", True))
     include_retrieval = bool(cfg.get("evaluation", {}).get("retrieval_metrics", True))
     selection_mode = str(cfg.get("evaluation", {}).get("selection", "confidence"))
+    ranker = None
+    if selection_mode == "ranker":
+        weights_path = cfg.get("evaluation", {}).get("ranker_weights", "models/selector_weights.json")
+        if not os.path.exists(weights_path):
+            raise FileNotFoundError(f"evaluation.selection=ranker needs {weights_path}")
+        ranker = Ranker.load(weights_path)
 
     def select_candidate(cands, contexts, record_time):
         if selection_mode == "majority":
             return select_majority_vote(cands, qa, contexts, record_time)
+        if selection_mode == "ranker":
+            return select_ranker(cands, qa, contexts, ranker, record_time)
         return select_qa_score(cands, qa, contexts, record_time)
 
     predictions = []

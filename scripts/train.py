@@ -31,7 +31,7 @@ from activeqa.policy_gradient import reinforce_batch_step, sft_batch_step
 from activeqa.preprocessing import entity_signature
 from activeqa.qa_model import TeluguQA
 from activeqa.reformulator import Reformulator
-from activeqa.rewards import reward
+from activeqa.rewards import reward, token_f1
 from activeqa.utils import load_config, setup_cpu
 
 
@@ -66,6 +66,19 @@ def main():
     if method not in {"reinforce", "rft"}:
         raise ValueError(f"Unknown training.method={method!r}; use 'reinforce' or 'rft'")
     margin = float(cfg["training"].get("min_reward_margin", 0.0))
+    collect_selector_data = bool(cfg["training"].get("collect_selector_data", False))
+    selector_records = []
+    selector_path = os.path.join("outputs", "selector_dataset.jsonl")
+
+    if bool(cfg["training"].get("skip_training", False)):
+        # Guard the eval-only phase: refuse to touch (or clobber) the trained
+        # checkpoint; evaluation is driven separately by scripts/evaluate.py.
+        checkpoint_exists = os.path.exists(cfg["training"]["checkpoint"])
+        if not checkpoint_exists:
+            raise FileNotFoundError(f"training.skip_training requires an existing checkpoint: "
+                                    f"{cfg['training']['checkpoint']}")
+        print("skip_training=true; nothing to do (checkpoint kept as is)", flush=True)
+        return
 
     train, evaluation, _retrieval_corpus = load_splits(cfg["data"], include_full_train=True)
     save_splits(train, evaluation)
@@ -132,6 +145,10 @@ def main():
                   f"updates={len(update_log)}", flush=True)
         except Exception as exc:
             print(f"could_not_load_previous_metrics={exc}", flush=True)
+    if args.resume and collect_selector_data and os.path.exists(selector_path):
+        with open(selector_path, encoding="utf-8") as stream:
+            selector_records = [json.loads(line) for line in stream if line.strip()]
+        print(f"resumed_selector_records={len(selector_records)}", flush=True)
     pending = []  # REINFORCE: (logprob, advantage, reward); RFT: (logprob, best, original)
     rows_in_batch = 0
     confidences = []  # span confidence per sampled rewrite (deployment alignment)
@@ -174,6 +191,20 @@ def main():
             if keep_step_checkpoints:
                 save_checkpoint(step_checkpoint_path(checkpoint, update_step),
                                 ref, optimizer, update_step, action_step)
+
+    last_selector_write = 0
+
+    def write_selector_dataset():
+        nonlocal last_selector_write
+        if not collect_selector_data or len(selector_records) == last_selector_write:
+            return
+        os.makedirs("outputs", exist_ok=True)
+        with open(selector_path, "w", encoding="utf-8") as stream:
+            for record in selector_records:
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"selector_dataset_written questions={len(selector_records)} "
+              f"path={selector_path}", flush=True)
+        last_selector_write = len(selector_records)
 
     for epoch in range(epochs):
         progress = tqdm(train, desc=f"epoch {epoch+1}/{epochs}", unit="q", dynamic_ncols=True)
@@ -228,12 +259,6 @@ def main():
                      and confidences[i] >= original_confidence),
                     key=lambda i: values[i], default=None)
                 diag_index = max(range(len(sampled)), key=values.__getitem__)
-                best_index = max(
-                    (i for i in range(len(sampled))
-                     if sampled[i]["valid"]
-                     and values[i] >= original_reward + margin
-                     and confidences[i] >= original_confidence),
-                    key=lambda i: values[i], default=None)
                 best_action = sampled[diag_index]
                 best_reward = values[diag_index]
                 best_confidence = confidences[diag_index]
@@ -260,6 +285,29 @@ def main():
                     "candidate_validity": [a["valid"] for a in sampled],
                     "target_text": best_action["sampled_text"],
                 })
+                if collect_selector_data:
+                    # Candidate pool for the offline ranker. Gold answers label
+                    # these records, but the features stored here are all
+                    # reference-free (see src/activeqa/ranker.py) — the same
+                    # features the deployed selector will compute. Invalid
+                    # candidates are excluded: at deployment they surface as the
+                    # original question, so they are not real choices.
+                    f1s = [token_f1(answer, row["answers"])
+                           for (answer, _, _) in qa_answers[1:]]
+                    selector_records.append({
+                        "id": row["id"],
+                        "epoch": epoch + 1,
+                        "question": row["question"],
+                        "original_answer": qa_answers[0][0],
+                        "original_confidence": qa_answers[0][2],
+                        "original_f1": token_f1(qa_answers[0][0], row["answers"]),
+                        "candidates": [a["candidate"] for a in sampled],
+                        "validity": [a["valid"] for a in sampled],
+                        "answers": [x[0] for x in qa_answers[1:]],
+                        "confidences": [x[2] for x in qa_answers[1:]],
+                        "f1s": f1s,
+                    })
+
                 if selected:
                     logprob = ref.sequence_logprob_ids(
                         row["question"], best_action["token_ids"],
@@ -318,8 +366,10 @@ def main():
 
         flush_batch(epoch + 1)
         rows_in_batch = 0
+        write_selector_dataset()
 
     flush_batch(epochs)
+    write_selector_dataset()
     save_checkpoint(checkpoint, ref, optimizer, update_step, action_step)
     os.makedirs("outputs", exist_ok=True)
     elapsed = elapsed_offset + (time.perf_counter() - started)
