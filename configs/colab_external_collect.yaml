@@ -44,6 +44,8 @@ training:
   checkpoint_every_steps: 25
   checkpoint: outputs/external_rft_policy.pt
 evaluation:
+  selection: ranker
+  ranker_weights: models/selector_weights.json
   do_sample: true
   retrieval_metrics: false
 outputs: outputs

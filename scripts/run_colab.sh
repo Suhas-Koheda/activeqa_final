@@ -3,7 +3,36 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
-CONFIG_PATH="${1:-configs/colab_external_smoke.yaml}"
+CONFIG_PATH="configs/colab_external_collect.yaml"
+CONFIG_SET=0
+EVAL_ONLY=0
+RESUME=0
+QUESTION=""
+while (($#)); do
+  case "$1" in
+    --eval-only) EVAL_ONLY=1 ;;
+    --resume) RESUME=1 ;;
+    --smoke) CONFIG_PATH="configs/colab_external_rft_smoke.yaml"; CONFIG_SET=1 ;;
+    --question)
+      shift
+      (($#)) || { echo "ERROR: --question needs Telugu question text" >&2; exit 2; }
+      QUESTION="$1"
+      ;;
+    --help|-h)
+      echo "Usage: bash scripts/run_colab.sh [CONFIG] [--resume] [--eval-only] [--question TEXT]"
+      exit 0
+      ;;
+    --*) echo "ERROR: unknown option $1" >&2; exit 2 ;;
+    *)
+      if [[ "$CONFIG_SET" == "1" ]]; then
+        echo "ERROR: only one config path may be provided" >&2; exit 2
+      fi
+      CONFIG_PATH="$1"
+      CONFIG_SET=1
+      ;;
+  esac
+  shift
+done
 if [[ ! -f "$CONFIG_PATH" ]]; then
   echo "ERROR: config not found: $CONFIG_PATH" >&2
   echo "Usage: bash scripts/run_colab.sh [configs/colab_external_smoke.yaml]" >&2
@@ -43,7 +72,7 @@ PY
 echo "Installing Python dependencies without replacing Colab's CUDA PyTorch..."
 python -m pip install -q \
   'transformers>=4.40,<5' 'datasets>=2.19' 'rank-bm25>=0.2.2' 'peft>=0.11' \
-  'PyYAML>=6' 'psutil>=5.9' 'tqdm>=4.66' 'safetensors>=0.4' \
+  'PyYAML>=6' 'psutil>=5.9' 'tqdm>=4.66' 'safetensors>=0.4' 'scikit-learn>=1.3' \
   'sentencepiece>=0.2.0' 'protobuf>=4.25'
 
 # Colab may include an old optional torchao (for example 0.10.0). Recent PEFT
@@ -85,11 +114,29 @@ with open(sys.argv[1], encoding="utf-8") as stream:
     print(yaml.safe_load(stream)["training"]["checkpoint"])
 PY
 )"
-if [[ "${2:-}" == "--eval-only" || "${COLAB_EVAL_ONLY:-0}" == "1" ]]; then
+if [[ "$EVAL_ONLY" == "1" || "${COLAB_EVAL_ONLY:-0}" == "1" ]]; then
   run_stage "paired evaluation (eval-only)" python scripts/evaluate.py --config "$CONFIG_PATH" --checkpoint "$CHECKPOINT_PATH"
 else
-  run_stage "policy training" python scripts/train.py --config "$CONFIG_PATH"
+  TRAIN_ARGS=(--config "$CONFIG_PATH")
+  [[ "$RESUME" == "1" ]] && TRAIN_ARGS+=(--resume)
+  run_stage "policy training" python scripts/train.py "${TRAIN_ARGS[@]}"
+  COLLECT_SELECTOR="$(python - "$CONFIG_PATH" <<'PY'
+import sys, yaml
+with open(sys.argv[1], encoding="utf-8") as stream:
+    cfg = yaml.safe_load(stream)
+print(int(bool(cfg.get("training", {}).get("collect_selector_data", False))))
+PY
+)"
+  if [[ "$COLLECT_SELECTOR" == "1" ]]; then
+    run_stage "calibrate reference-free selector" python scripts/train_selector.py \
+      --dataset outputs/selector_dataset.jsonl --out models/selector_weights.json
+  fi
   run_stage "paired evaluation" python scripts/evaluate.py --config "$CONFIG_PATH" --checkpoint "$CHECKPOINT_PATH"
+fi
+
+if [[ -n "$QUESTION" ]]; then
+  run_stage "interactive Telugu question" python scripts/run_pipeline.py \
+    --config "$CONFIG_PATH" --checkpoint "$CHECKPOINT_PATH" --question "$QUESTION"
 fi
 
 echo

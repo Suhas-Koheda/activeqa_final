@@ -35,12 +35,12 @@ def build_points(records):
             continue
         pool_answers = [record["answers"][i] for i in valid_idx]
         pool_confs = [record["confidences"][i] for i in valid_idx]
-        entry = {
+        entry = points_by_question.setdefault(record["id"], {
             "question": record["question"],
             "original_f1": record["original_f1"],
-            "vectors": [],
-            "f1s": [],
-        }
+            "pools": [],
+        })
+        pool = {"vectors": [], "f1s": []}
         for i in valid_idx:
             features = candidate_features(
                 original_question=record["question"],
@@ -57,10 +57,13 @@ def build_points(records):
             label = int(record["f1s"][i] > record["original_f1"] + 1e-9)
             X.append(vector)
             y.append(label)
-            entry["vectors"].append(vector)
-            entry["f1s"].append(record["f1s"][i])
-        if entry["vectors"]:
-            points_by_question[record["id"]] = entry
+            pool["vectors"].append(vector)
+            pool["f1s"].append(record["f1s"][i])
+        if pool["vectors"]:
+            # Keep each sampled pool intact. Treating candidates from different
+            # epochs as one pool would let offline CV select an action that was
+            # never available alongside the other actions it is compared with.
+            entry["pools"].append(pool)
     return X, y, points_by_question
 
 
@@ -85,8 +88,11 @@ def main():
                 records.append(json.loads(line))
 
     X, y, questions = build_points(records)
-    if len(questions) < args.splits * 4 or len(set(y)) < 2:
-        raise SystemExit("not enough usable data to calibrate the ranker")
+    if len(questions) < 8:
+        raise SystemExit(f"not enough usable data to calibrate the ranker: "
+                         f"need at least 8 distinct questions, got {len(questions)}")
+
+    splits = min(args.splits, max(2, len(questions) // 4))
 
     positive_rate = sum(y) / len(y)
     print(f"records={len(records)} questions={len(questions)} "
@@ -95,32 +101,35 @@ def main():
     # Question-grouped cross-validation: fit on whole questions, simulate the
     # "switch only above threshold" policy on whole held-out questions.
     question_ids = sorted(questions)
-    fold_of = {q: k % args.splits for k, q in enumerate(question_ids)}
-    thresholds = [round(t * 0.05, 2) for t in range(2, 19)]
+    fold_of = {q: k % splits for k, q in enumerate(question_ids)}
+    # 1.01 explicitly represents the always-abstain policy. If every learned
+    # switch hurts on cross-validation, calibration can choose the safe policy.
+    thresholds = [round(t * 0.05, 2) for t in range(2, 19)] + [1.01]
     totals = {t: {"delta": 0.0, "questions": 0, "switches": 0} for t in thresholds}
-    for split in range(args.splits):
+    for split in range(splits):
         train_qs = [q for q in question_ids if fold_of[q] != split]
         test_qs = [q for q in question_ids if fold_of[q] == split]
-        train_X = [v for q in train_qs for v in questions[q]["vectors"]]
-        train_y = [label for q in train_qs for label in
-                   [int(f > questions[q]["original_f1"] + 1e-9) for f in questions[q]["f1s"]]]
+        train_X = [v for q in train_qs for pool in questions[q]["pools"]
+                   for v in pool["vectors"]]
+        train_y = [int(f > questions[q]["original_f1"] + 1e-9)
+                   for q in train_qs for pool in questions[q]["pools"]
+                   for f in pool["f1s"]]
         if len({label for label in train_y}) < 2:
             continue
         model = fit_logistic(train_X, train_y)
         for q in test_qs:
             entry = questions[q]
-            probs = model.predict_proba(entry["vectors"])[:, 1]
-            if len(probs) == 0:
-                continue
-            best = max(range(len(probs)), key=lambda k: probs[k])
-            for t in thresholds:
-                slot = totals[t]
-                slot["questions"] += 1
-                if best is None:
+            for pool in entry["pools"]:
+                probs = model.predict_proba(pool["vectors"])[:, 1]
+                if len(probs) == 0:
                     continue
-                if probs[best] >= t:
-                    slot["switches"] += 1
-                    slot["delta"] += entry["f1s"][best] - entry["original_f1"]
+                best = max(range(len(probs)), key=lambda k: probs[k])
+                for t in thresholds:
+                    slot = totals[t]
+                    slot["questions"] += 1
+                    if probs[best] >= t:
+                        slot["switches"] += 1
+                        slot["delta"] += pool["f1s"][best] - entry["original_f1"]
 
     table = []
     for t in thresholds:
@@ -133,21 +142,35 @@ def main():
         print(f"threshold={t:.2f} switch_rate={table[-1]['switch_rate']:.3f} "
               f"mean_f1_delta={table[-1]['mean_f1_delta_per_question']:+.4f}", flush=True)
 
-    best = max(table, key=lambda r: r["mean_f1_delta_per_question"])
+    # On ties prefer the more conservative switch threshold, including the
+    # explicit no-switch option. This prevents an all-zero CV table from
+    # accidentally choosing a permissive threshold just because it appeared first.
+    best = max(table, key=lambda r: (r["mean_f1_delta_per_question"], r["threshold"]))
     print(f"chosen_threshold={best['threshold']} "
           f"switch_rate={best['switch_rate']:.3f} "
           f"mean_f1_delta={best['mean_f1_delta_per_question']:+.4f}", flush=True)
 
-    final = fit_logistic(X, y)
+    if len(set(y)) < 2:
+        # A single observed label cannot train a classifier. Emit a valid,
+        # reference-free artifact that always falls back to the original.
+        coef = [0.0] * len(FEATURE_NAMES)
+        intercept = 0.0
+        best = {"threshold": 1.01, "switch_rate": 0.0,
+                "mean_f1_delta_per_question": 0.0}
+    else:
+        final = fit_logistic(X, y)
+        coef = [float(v) for v in final.coef_[0]]
+        intercept = float(final.intercept_[0])
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     artifact = {
         "names": list(FEATURE_NAMES),
-        "coef": [float(v) for v in final.coef_[0]],
-        "intercept": float(final.intercept_[0]),
+        "coef": coef,
+        "intercept": intercept,
         "switch_threshold": best["threshold"],
         "meta": {
             "records": len(records),
             "questions": len(questions),
+            "cross_validation_splits": splits,
             "points": len(X),
             "positive_rate": positive_rate,
             "cv_switch_rate": best["switch_rate"],
