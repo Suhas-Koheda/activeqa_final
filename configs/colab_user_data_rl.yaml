@@ -1,0 +1,51 @@
+# SFT warm-up on the 107 deduplicated, user-provided rewrite triples, then
+# answer-reward REINFORCE on the independent context-grounded Telugu QA train set.
+device: cuda
+seed: 42
+cpu_threads: 4
+data:
+  dataset: ai4bharat/IndicQA
+  config: indicqa.te
+  cache_dir: data/cache
+  external_train_dataset: nlpctx/activeqa-telugu-rl-data
+  external_train_file: data/indic_rag_te/train.jsonl
+  reformulation_dataset: null
+  reformulation_train_file: data/indic_rag_te/user_reformulations/train.jsonl
+  reformulation_dev_file: data/indic_rag_te/user_reformulations/dev.jsonl
+  train_examples: null
+  eval_examples: 100
+  eval_fraction: 0.2
+models:
+  reformulator: ai4bharat/MultiIndicParaphraseGenerationSS
+  qa: l3cube-pune/telugu-question-answering-squad-bert
+  cache_dir: models
+  lora_rank: 16
+  lora_alpha: 32
+generation:
+  candidates_per_question: 3
+  max_input_tokens: 96
+  max_new_tokens: 64
+  do_sample: true
+retrieval:
+  top_k: 3
+  max_context_chars: 1200
+training:
+  sft_warmup: true
+  sft_warmup_epochs: 2
+  sft_learning_rate: 0.000005
+  sft_checkpoint_every_steps: 25
+  sft_checkpoint: outputs/user_data_sft_policy.pt
+  method: reinforce
+  epochs: 2
+  learning_rate: 0.00001
+  batch_questions: 8
+  gradient_clip_norm: 1.0
+  checkpoint_every_steps: 50
+  checkpoint: outputs/user_data_rl_policy.pt
+  keep_step_checkpoints: true
+evaluation:
+  do_sample: true
+  reformulation_pair_do_sample: false
+  selection: confidence
+  retrieval_metrics: false
+outputs: outputs
