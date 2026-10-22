@@ -31,7 +31,7 @@ def _anchor_overlap(source, candidate):
     return matched / len(source_words) >= .55
 
 class Reformulator:
-    def __init__(self, name, cache_dir="models", rank=4, alpha=8, language="te", device="cpu"):
+    def __init__(self, name, cache_dir="models", rank=None, alpha=None, language="te", device="cpu"):
         from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
         # This checkpoint explicitly documents the slow AlbertTokenizer path. `use_fast=True`
         # attempts an unsupported conversion and fails when its legacy vocab_file is None.
@@ -65,16 +65,13 @@ class Reformulator:
         self.model.generation_config.bos_token_id=self.bos_token_id
         self.model.generation_config.eos_token_id=self.eos_token_id
         self.cache={}
-        try:
-            from peft import LoraConfig, get_peft_model, TaskType
-            modules=set(n.split(".")[-1] for n,_ in self.model.named_modules())
-            targets=[m for m in ("q","v","k","o") if m in modules]
-            if not targets: targets=[m for m in ("q_proj","v_proj") if m in modules]
-            if targets:
-                self.model=get_peft_model(self.model,LoraConfig(r=rank,lora_alpha=alpha,target_modules=targets,task_type=TaskType.SEQ_2_SEQ_LM)); self.peft=True
-            else: raise RuntimeError("No compatible attention projection modules for LoRA")
-        except Exception as e:
-            raise RuntimeError(f"Could not attach LoRA adapter to {name}: {e}") from e
+        # This is a full-parameter policy-gradient run: every reformulator
+        # parameter is trainable. Gradient checkpointing keeps it practical on
+        # Colab T4 GPUs without replacing the RL update with an adapter-only fit.
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            self.model.gradient_checkpointing_enable()
+        if hasattr(self.model.config, "use_cache"):
+            self.model.config.use_cache = False
         self.trainable=[p for p in self.model.parameters() if p.requires_grad]
         self.trainable_count=sum(p.numel() for p in self.trainable)
 

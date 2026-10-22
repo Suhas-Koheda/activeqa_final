@@ -33,3 +33,20 @@ def setup_cpu(seed: int, threads: int, device: str = "cpu"):
 def elapsed_since(start): return round(time.perf_counter() - start, 3)
 
 def ensure_parent(path): Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+def make_policy_optimizer(params, lr):
+    """Memory efficient optimizer for full-model policy-gradient updates."""
+    from transformers.optimization import Adafactor
+    return Adafactor(params, lr=float(lr), scale_parameter=False,
+                     relative_step=False, warmup_init=False)
+
+def load_policy_state(model, saved):
+    """Load current full-model policy checkpoints and legacy LoRA checkpoints."""
+    if "model_state" in saved:
+        model.load_state_dict(saved["model_state"])
+        return
+    if "adapter" in saved:
+        from peft import set_peft_model_state_dict
+        set_peft_model_state_dict(model, saved["adapter"])
+        return
+    raise ValueError("Checkpoint has no model_state or legacy adapter weights")

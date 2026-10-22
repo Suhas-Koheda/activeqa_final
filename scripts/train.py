@@ -33,7 +33,7 @@ from activeqa.preprocessing import entity_signature
 from activeqa.qa_model import TeluguQA
 from activeqa.reformulator import Reformulator
 from activeqa.rewards import reward, token_f1
-from activeqa.utils import load_config, setup_cpu
+from activeqa.utils import load_config, setup_cpu, make_policy_optimizer, load_policy_state
 
 
 def step_checkpoint_path(path, step):
@@ -43,9 +43,8 @@ def step_checkpoint_path(path, step):
 
 def save_checkpoint(path, ref, optimizer, update_step, action_step):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    from peft import get_peft_model_state_dict
     torch.save({
-        "adapter": get_peft_model_state_dict(ref.model),
+        "model_state": ref.model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "update_step": update_step,
         "action_step": action_step,
@@ -94,7 +93,7 @@ def main():
 
     started = time.perf_counter()
     ref = Reformulator(cfg["models"]["reformulator"], cfg["models"]["cache_dir"],
-                       cfg["models"]["lora_rank"], cfg["models"]["lora_alpha"],
+                       cfg["models"].get("lora_rank"), cfg["models"].get("lora_alpha"),
                        device=cfg.get("device", "cpu"))
     print(f"reformulator_load_seconds={time.perf_counter()-started:.1f}; "
           f"trainable_parameters={ref.trainable_count}", flush=True)
@@ -109,14 +108,13 @@ def main():
             sft_saved = torch.load(sft_checkpoint, map_location="cpu", weights_only=False)
             if sft_saved.get("base_model") != ref.base_name or not sft_saved.get("complete"):
                 raise ValueError("SFT warm-up checkpoint is incomplete or uses a different base model")
-            from peft import set_peft_model_state_dict
-            set_peft_model_state_dict(ref.model, sft_saved["adapter"])
+            load_policy_state(ref.model, sft_saved)
             print(f"loaded_reformulation_sft_warmup={sft_checkpoint}", flush=True)
     qa_started = time.perf_counter()
     qa = TeluguQA(cfg["models"]["qa"], cfg["models"]["cache_dir"], device=cfg.get("device", "cpu"))
     print(f"qa_load_seconds={time.perf_counter()-qa_started:.1f}", flush=True)
 
-    optimizer = torch.optim.AdamW(ref.trainable, lr=cfg["training"]["learning_rate"])
+    optimizer = make_policy_optimizer(ref.trainable, cfg["training"]["learning_rate"])
     checkpoint = cfg["training"]["checkpoint"]
     checkpoint_every = int(cfg["training"].get("checkpoint_every_steps", 0))
     keep_step_checkpoints = bool(cfg["training"].get("keep_step_checkpoints", False))
@@ -127,11 +125,10 @@ def main():
     if args.resume:
         if not os.path.exists(checkpoint):
             raise FileNotFoundError(f"Cannot resume: checkpoint does not exist: {checkpoint}")
-        from peft import set_peft_model_state_dict
         saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
         if saved.get("base_model") != ref.base_name:
             raise ValueError("Checkpoint base model does not match configured reformulator")
-        set_peft_model_state_dict(ref.model, saved["adapter"])
+        load_policy_state(ref.model, saved)
         optimizer.load_state_dict(saved["optimizer"])
         start_action = int(saved.get("action_step", saved.get("step", 0)))
         update_step = int(saved.get("update_step", 0))

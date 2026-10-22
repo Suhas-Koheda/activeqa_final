@@ -14,7 +14,7 @@ sys.path.insert(0, "src")
 from activeqa.data import load_reformulation_splits
 from activeqa.policy_gradient import sft_batch_step
 from activeqa.reformulator import Reformulator
-from activeqa.utils import load_config, setup_cpu
+from activeqa.utils import load_config, setup_cpu, make_policy_optimizer, load_policy_state
 
 
 def main():
@@ -34,11 +34,11 @@ def main():
         raise RuntimeError("Reformulation train and dev splits must both be non-empty")
 
     ref = Reformulator(cfg["models"]["reformulator"], cfg["models"]["cache_dir"],
-                       cfg["models"]["lora_rank"], cfg["models"]["lora_alpha"],
+                       cfg["models"].get("lora_rank"), cfg["models"].get("lora_alpha"),
                        device=cfg.get("device", "cpu"))
     params = ref.trainable
-    optimizer = torch.optim.AdamW(
-        params, lr=float(training.get("sft_learning_rate", 5e-6)))
+    optimizer = make_policy_optimizer(
+        params, float(training.get("sft_learning_rate", 5e-6)))
     checkpoint = training.get("sft_checkpoint", "outputs/external_rl_sft_policy.pt")
     checkpoint_every = max(1, int(training.get("sft_checkpoint_every_steps", 25)))
     start_step = 0
@@ -48,8 +48,7 @@ def main():
         saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
         if saved.get("base_model") != ref.base_name:
             raise ValueError("SFT checkpoint base model does not match configured reformulator")
-        from peft import set_peft_model_state_dict
-        set_peft_model_state_dict(ref.model, saved["adapter"])
+        load_policy_state(ref.model, saved)
         if saved.get("complete"):
             print(f"SFT warm-up already complete: {checkpoint}", flush=True)
             return
@@ -66,8 +65,7 @@ def main():
     os.makedirs(os.path.dirname(checkpoint) or ".", exist_ok=True)
 
     def save(step, complete=False):
-        from peft import get_peft_model_state_dict
-        torch.save({"adapter": get_peft_model_state_dict(ref.model),
+        torch.save({"model_state": ref.model.state_dict(),
                     "optimizer": optimizer.state_dict(), "step": step,
                     "complete": complete, "base_model": ref.base_name,
                     "losses": losses, "torch_rng_state": torch.get_rng_state()}, checkpoint)

@@ -1,0 +1,27 @@
+# English ActiveQA-style RL on the SearchQA dataset.
+device: cuda
+seed: 42
+cpu_threads: 4
+data:
+  dataset: qingduansan/searchqa
+  train_examples: 2500
+  eval_examples: 500
+  cache_dir: data/cache
+models:
+  reformulator: Vamsi/T5_Paraphrase_Paws
+  qa: deepset/roberta-base-squad2
+  cache_dir: models
+generation:
+  candidates_per_question: 3
+  max_input_tokens: 96
+  max_new_tokens: 48
+  do_sample: true
+training:
+  epochs: 1
+  learning_rate: 0.00001
+  gradient_clip_norm: 1.0
+  batch_questions: 4
+  checkpoint_every_steps: 100
+  checkpoint: outputs/english_searchqa_rl_policy.pt
+  model_dir: outputs/english_searchqa_rl_model
+outputs: outputs/english_searchqa

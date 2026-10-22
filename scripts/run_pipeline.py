@@ -12,7 +12,7 @@ from activeqa.inference import run_question
 from activeqa.qa_model import TeluguQA
 from activeqa.reformulator import Reformulator
 from activeqa.retrieval import Retriever
-from activeqa.utils import load_config, setup_cpu
+from activeqa.utils import load_config, setup_cpu, load_policy_state
 
 
 def main():
@@ -28,7 +28,7 @@ def main():
     setup_cpu(cfg["seed"], cfg["cpu_threads"], cfg.get("device", "cpu"))
     train, _evaluation = load_splits(cfg["data"])
     ref = Reformulator(cfg["models"]["reformulator"], cfg["models"]["cache_dir"],
-                       cfg["models"]["lora_rank"], cfg["models"]["lora_alpha"],
+                       cfg["models"].get("lora_rank"), cfg["models"].get("lora_alpha"),
                        device=cfg.get("device", "cpu"))
     checkpoint = args.checkpoint or cfg["training"].get("checkpoint")
     if not args.base_policy and checkpoint:
@@ -37,11 +37,10 @@ def main():
                 f"Trained adapter not found: {checkpoint}. Run the training workflow first "
                 "or pass --base-policy to use the pretrained reformulator."
             )
-        from peft import set_peft_model_state_dict
         saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
         if saved.get("base_model") != ref.base_name:
             raise ValueError("Checkpoint base model does not match configured reformulator")
-        set_peft_model_state_dict(ref.model, saved["adapter"])
+        load_policy_state(ref.model, saved)
 
     qa = TeluguQA(cfg["models"]["qa"], cfg["models"]["cache_dir"],
                   device=cfg.get("device", "cpu"))

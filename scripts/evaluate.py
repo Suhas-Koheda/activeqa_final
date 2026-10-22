@@ -9,6 +9,7 @@ from activeqa.data import load_reformulation_splits, load_splits
 from activeqa.evaluation import evaluate, evaluate_reformulation_pairs
 from activeqa.qa_model import TeluguQA
 from activeqa.reformulator import Reformulator
+from activeqa.utils import load_policy_state
 from activeqa.retrieval import Retriever
 from activeqa.utils import load_config, setup_cpu
 
@@ -23,7 +24,7 @@ def main():
     train, heldout, retrieval_corpus = load_splits(cfg["data"], include_full_train=True)
     _rewrite_train, rewrite_dev = load_reformulation_splits(cfg["data"])
     ref = Reformulator(cfg["models"]["reformulator"], cfg["models"]["cache_dir"],
-                       cfg["models"]["lora_rank"], cfg["models"]["lora_alpha"],
+                       cfg["models"].get("lora_rank"), cfg["models"].get("lora_alpha"),
                        device=cfg.get("device", "cpu"))
     qa = TeluguQA(cfg["models"]["qa"], cfg["models"]["cache_dir"], device=cfg.get("device", "cpu"))
     retriever = Retriever(retrieval_corpus)
@@ -38,12 +39,11 @@ def main():
             label="reformulation_dev_pretrained")
     }
     sft_checkpoint = cfg["training"].get("sft_checkpoint")
-    if sft_checkpoint and os.path.isfile(sft_checkpoint):
-        from peft import set_peft_model_state_dict
+    if cfg["training"].get("sft_warmup", False) and sft_checkpoint and os.path.isfile(sft_checkpoint):
         sft_saved = torch.load(sft_checkpoint, map_location="cpu", weights_only=False)
         if sft_saved.get("base_model") != ref.base_name or not sft_saved.get("complete"):
             raise ValueError("SFT warm-up checkpoint is incomplete or uses a different base model")
-        set_peft_model_state_dict(ref.model, sft_saved["adapter"])
+        load_policy_state(ref.model, sft_saved)
         torch.manual_seed(cfg["seed"])
         sft_qa = evaluate(heldout, ref, qa, retriever, cfg,
                           "outputs/eval_sft_warmup.json", label="sft_warmup")
@@ -53,11 +53,10 @@ def main():
             rewrite_dev, ref, qa, cfg, "outputs/reformulations_sft_warmup.json",
             label="reformulation_dev_sft_warmup")
     if args.checkpoint:
-        from peft import set_peft_model_state_dict
         saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         if saved.get("base_model") != ref.base_name:
             raise ValueError("Checkpoint base model does not match configured reformulator")
-        set_peft_model_state_dict(ref.model, saved["adapter"])
+        load_policy_state(ref.model, saved)
         torch.manual_seed(cfg["seed"])
         trained = evaluate(heldout, ref, qa, retriever, cfg, "outputs/eval_trained.json", label="reinforce_trained")
         combined["reinforce_trained"] = trained
