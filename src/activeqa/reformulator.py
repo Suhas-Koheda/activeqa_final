@@ -1,6 +1,34 @@
 from __future__ import annotations
+import re
 import torch
-from .preprocessing import normalize, entity_signature, interrogatives
+from .preprocessing import normalize, entity_signature, interrogatives, tokens
+
+
+_TELUGU_RE = re.compile(r"[\u0c00-\u0c7f]")
+_OUTPUT_MARKER_RE = re.compile(r"\[(?:more|continued|truncated)\]", re.I)
+_TELUGU_FUNCTION_WORDS = {
+    "ఏ", "ఏది", "ఏమి", "ఏమిటి", "ఎవరు", "ఎప్పుడు", "ఎక్కడ", "ఎందుకు", "ఎలా",
+    "ఎన్ని", "ఎంత", "లో", "కి", "కు", "తో", "మరియు", "అని", "గా", "నే", "ను",
+    "ది", "లు", "ఒక", "ఈ", "ఆ", "ఏదైనా", "చెప్పండి", "తెలుపుము", "పేర్కొనండి",
+}
+
+
+def _anchor_overlap(source, candidate):
+    """Conservative lexical guard against dropping Telugu names/topic words."""
+    source_words = [w for w in tokens(source) if len(w) >= 3 and w not in _TELUGU_FUNCTION_WORDS]
+    target_words = tokens(candidate)
+    if not source_words:
+        return True
+    # Names may acquire a Telugu case ending in a rewrite; allow a small edit
+    # distance while requiring most source content words to remain recognizable.
+    from difflib import SequenceMatcher
+    matched = 0
+    for word in source_words:
+        if any(word == other or word in other or other in word or
+               SequenceMatcher(None, word, other).ratio() >= .78
+               for other in target_words):
+            matched += 1
+    return matched / len(source_words) >= .55
 
 class Reformulator:
     def __init__(self, name, cache_dir="models", rank=4, alpha=8, language="te", device="cpu"):
@@ -107,9 +135,15 @@ class Reformulator:
         if not terminated: return False
         if not candidate or len(candidate)>max(300,4*len(original)): return False
         if len(candidate)<2 or candidate==original: return False
+        if _OUTPUT_MARKER_RE.search(candidate): return False
+        # Reject outputs that have collapsed into Latin/tokenizer noise. Allow
+        # Latin names and numbers when the actual question remains Telugu.
+        telugu_letters = len(_TELUGU_RE.findall(candidate))
+        if telugu_letters < 3 or telugu_letters / max(1, len(candidate)) < .20: return False
         # Preserve the answer type (which/who/when/where/why/how) as well as
         # numeric/Latin entities; changing the interrogative changes the answer.
         if not interrogatives(original).issubset(interrogatives(candidate)): return False
+        if not _anchor_overlap(original, candidate): return False
         return entity_signature(original).issubset(entity_signature(candidate))
 
     def sequence_logprob(self, question, sampled, max_input=96, max_new=64):
@@ -137,6 +171,15 @@ class Reformulator:
         logp=torch.log_softmax(out.logits,dim=-1)
         selected=logp.gather(-1,labels.unsqueeze(-1)).squeeze(-1)
         return selected.sum()
+
+    def sequence_mean_logprob(self, question, sampled, max_input=96, max_new=64):
+        """Mean token log likelihood, for length-neutral supervised warm-up."""
+        tgt=self.tokenizer(normalize(sampled),add_special_tokens=False,return_tensors="pt",
+                           truncation=True,max_length=max(1,max_new-1))
+        ids=tgt.input_ids[0].tolist()
+        if self.tokenizer.eos_token_id is not None:
+            ids.append(self.tokenizer.eos_token_id)
+        return self.sequence_logprob_ids(question, ids, max_input) / max(1, len(ids))
 
     def sequence_logprob_ids_batch(self, question, token_ids_list, max_input=96):
         """Teacher-force several sampled actions for one question in one pass.

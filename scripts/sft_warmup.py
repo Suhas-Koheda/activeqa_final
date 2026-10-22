@@ -83,9 +83,12 @@ def main():
                 step += 1
                 continue
             row = train_pairs[row_index]
-            logprob = ref.sequence_logprob(row["question"], row["reformulation"],
-                                           max_input=max_input,
-                                           max_new=int(cfg["generation"]["max_new_tokens"]))
+            # Average by target token count so long targets do not receive a
+            # larger update merely because their summed log likelihood is more
+            # negative.
+            logprob = ref.sequence_mean_logprob(
+                row["question"], row["reformulation"], max_input=max_input,
+                max_new=int(cfg["generation"]["max_new_tokens"]))
             loss = sft_batch_step([logprob], optimizer, params,
                                   float(training.get("gradient_clip_norm", 1.0)))
             losses.append(loss)

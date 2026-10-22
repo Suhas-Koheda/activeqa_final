@@ -14,12 +14,13 @@ from .selection import select_majority_vote, select_oracle, select_qa_score, sel
 
 
 def evaluate_reformulation_pairs(rows, reformulator, qa, cfg, outfile, label="rewrite_pairs"):
-    """Evaluate on held-out rule-pair rows; references never choose a prediction."""
+    """Evaluate rewrite references; run answer checks only when context exists."""
     started = time.perf_counter()
     proc = psutil.Process()
     peak_rss = proc.memory_info().rss
     exact = f1s = valid = harmful = 0
     original_qa_f1 = generated_qa_f1 = target_qa_f1 = 0.0
+    qa_examples = harmful_examples = 0
     qa_seconds = 0.0
     predictions = []
     max_input = int(cfg["generation"]["max_input_tokens"])
@@ -34,22 +35,28 @@ def evaluate_reformulation_pairs(rows, reformulator, qa, cfg, outfile, label="re
         pair_f1 = token_f1(prediction, [target])
         f1s += pair_f1
 
-        answers = qa.answer_batch([row["question"], prediction, target], row["context"])
-        qa_seconds += answers[0][1] if answers else 0.0
-        source_f1 = token_f1(answers[0][0], row["answers"])
-        prediction_f1 = token_f1(answers[1][0], row["answers"])
-        target_f1 = token_f1(answers[2][0], row["answers"])
-        original_qa_f1 += source_f1
-        generated_qa_f1 += prediction_f1
-        target_qa_f1 += target_f1
+        answers = None
+        source_f1 = prediction_f1 = target_f1 = None
+        if row.get("context", "").strip() and row.get("answers"):
+            answers = qa.answer_batch([row["question"], prediction, target], row["context"])
+            qa_seconds += answers[0][1] if answers else 0.0
+            source_f1 = token_f1(answers[0][0], row["answers"])
+            prediction_f1 = token_f1(answers[1][0], row["answers"])
+            target_f1 = token_f1(answers[2][0], row["answers"])
+            original_qa_f1 += source_f1
+            generated_qa_f1 += prediction_f1
+            target_qa_f1 += target_f1
+            qa_examples += 1
+            harmful_examples += int(prediction_f1 < source_f1)
         valid += int(action["valid"])
-        harmful += int(prediction_f1 < source_f1)
+        harmful += int(prediction_f1 is not None and prediction_f1 < source_f1)
         predictions.append({
             "id": row["id"], "question": row["question"], "reference_reformulation": target,
             "generated_reformulation": prediction, "valid": action["valid"],
             "pair_token_f1": pair_f1, "answer_reference": row["answers"],
-            "original_answer": answers[0][0], "generated_answer": answers[1][0],
-            "target_rewrite_answer": answers[2][0],
+            "original_answer": answers[0][0] if answers else None,
+            "generated_answer": answers[1][0] if answers else None,
+            "target_rewrite_answer": answers[2][0] if answers else None,
             "original_answer_f1": source_f1, "generated_answer_f1": prediction_f1,
             "target_rewrite_answer_f1": target_f1,
         })
@@ -58,17 +65,18 @@ def evaluate_reformulation_pairs(rows, reformulator, qa, cfg, outfile, label="re
     n = max(1, len(rows))
     metrics = {
         "examples": len(rows),
-        "label_status": "silver rule-based rewrite references; not human verified",
+        "label_status": sorted({row.get("label_status", "unspecified") for row in rows}),
         "decoding": "sampled" if cfg.get("evaluation", {}).get("reformulation_pair_do_sample", False) else "greedy",
         "rewrite_exact_match": exact / n,
         "rewrite_token_f1": f1s / n,
         "valid_generation_rate": valid / n,
-        "harmful_reformulation_rate": harmful / n,
-        "canonical_answer_f1": {
-            "original_question": original_qa_f1 / n,
-            "generated_rewrite": generated_qa_f1 / n,
-            "rule_reference_rewrite": target_qa_f1 / n,
-        },
+        "harmful_reformulation_rate": harmful / max(1, harmful_examples),
+        "canonical_answer_f1": ({
+            "examples_with_context": qa_examples,
+            "original_question": original_qa_f1 / max(1, qa_examples),
+            "generated_rewrite": generated_qa_f1 / max(1, qa_examples),
+            "reference_rewrite": target_qa_f1 / max(1, qa_examples),
+        } if qa_examples else None),
         "qa_seconds": round(qa_seconds, 2),
         "wall_seconds": round(time.perf_counter() - started, 2),
         "peak_rss_mb": round(peak_rss / 1e6, 1),
