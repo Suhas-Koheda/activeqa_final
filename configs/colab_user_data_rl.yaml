@@ -43,9 +43,15 @@ training:
   checkpoint_every_steps: 50
   checkpoint: outputs/user_data_rl_policy.pt
   keep_step_checkpoints: true
+  # The held-out run showed REINFORCE hurt rewrite F1; serve the better SFT
+  # adapter until an RL run demonstrates a gain.
+  inference_checkpoint: outputs/user_data_sft_policy.pt
 evaluation:
   do_sample: true
   reformulation_pair_do_sample: false
   selection: confidence
   retrieval_metrics: false
 outputs: outputs
+inference:
+  # Abstain on weak retrieval answers instead of returning an unrelated span.
+  min_answer_confidence: -2.0

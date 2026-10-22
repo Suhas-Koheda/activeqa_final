@@ -17,5 +17,8 @@ def run_question(question,ref,qa,retriever,cfg):
         chosen=select_qa_score(selection_candidates,qa,passages)
     answers=[qa.answer_with_score(chosen,p["context"]) for p in passages]
     answer,_,confidence=max(answers,key=lambda item:item[2])
+    min_confidence=float(cfg.get("inference", {}).get("min_answer_confidence", float("-inf")))
+    abstained=confidence < min_confidence
     return {"question":question,"candidates":cs,"selected_question":chosen,
-            "answer":answer,"answer_confidence":confidence,"contexts":passages}
+            "answer":"" if abstained else answer,"answer_confidence":confidence,
+            "answer_abstained":abstained,"contexts":passages}

@@ -146,8 +146,16 @@ PY
 fi
 
 if [[ -n "$QUESTION" ]]; then
+  INFERENCE_CHECKPOINT_PATH="$(python - "$CONFIG_PATH" <<'PY'
+import sys, yaml
+with open(sys.argv[1], encoding="utf-8") as stream:
+    cfg = yaml.safe_load(stream)
+training = cfg.get("training", {})
+print(training.get("inference_checkpoint") or training.get("checkpoint", ""))
+PY
+)"
   run_stage "interactive Telugu question" python scripts/run_pipeline.py \
-    --config "$CONFIG_PATH" --checkpoint "$CHECKPOINT_PATH" --question "$QUESTION"
+    --config "$CONFIG_PATH" --checkpoint "$INFERENCE_CHECKPOINT_PATH" --question "$QUESTION"
 fi
 
 echo

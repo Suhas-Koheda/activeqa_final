@@ -1,5 +1,5 @@
 from rank_bm25 import BM25Okapi
-from .preprocessing import tokens
+from .preprocessing import normalize, tokens
 
 class Retriever:
     def __init__(self, rows):
@@ -8,10 +8,15 @@ class Retriever:
         scores=self.bm25.get_scores(tokens(query) or ["<empty>"])
         ids=sorted(range(len(scores)),key=lambda i:(scores[i],-i),reverse=True)
         out=[]
+        seen_contexts=set()
         for i in ids:
             row=self.rows[i]
             if exclude_id is not None and row.get("id")==exclude_id: continue
             if not row["context"]: continue
-            out.append({"id":row.get("id"),"context":row["context"][:max_chars],"score":float(scores[i])})
+            context=normalize(row["context"])
+            key=context.casefold()
+            if key in seen_contexts: continue
+            seen_contexts.add(key)
+            out.append({"id":row.get("id"),"context":context[:max_chars],"score":float(scores[i])})
             if len(out)>=top_k: break
         return out
