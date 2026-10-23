@@ -5,12 +5,40 @@ from .preprocessing import normalize, entity_signature, interrogatives, tokens
 
 
 _TELUGU_RE = re.compile(r"[\u0c00-\u0c7f]")
+_FOREIGN_INDIC_RE = re.compile(r"[\u0900-\u0bff\u0d00-\u0d7f]")
 _OUTPUT_MARKER_RE = re.compile(r"\[(?:more|continued|truncated)\]", re.I)
 _TELUGU_FUNCTION_WORDS = {
     "ఏ", "ఏది", "ఏమి", "ఏమిటి", "ఎవరు", "ఎప్పుడు", "ఎక్కడ", "ఎందుకు", "ఎలా",
     "ఎన్ని", "ఎంత", "లో", "కి", "కు", "తో", "మరియు", "అని", "గా", "నే", "ను",
     "ది", "లు", "ఒక", "ఈ", "ఆ", "ఏదైనా", "చెప్పండి", "తెలుపుము", "పేర్కొనండి",
 }
+
+
+def _answer_type(text):
+    words = set(tokens(text))
+    if "శతాబ్దం" in words or "శతాబ్దంలో" in words or "శతాబ్దానికి" in words:
+        return "century"
+    if any(w.startswith("సంవత్సర") for w in words): return "year"
+    if any(w.startswith("తేదీ") for w in words): return "date"
+    if any(w.startswith("ఎన్ని") for w in words) or "సంఖ్య" in words: return "count"
+    if "ఎంత" in words: return "amount"
+    if any(w in words for w in ("ఎక్కడ", "ప్రదేశం", "నగరంలో", "స్థానం")): return "place"
+    if "ఎందుకు" in words: return "reason"
+    if any(w in words for w in ("ఎలా", "విధంగా")): return "manner"
+    if any(w in words for w in ("ఎప్పుడు", "సమయంలో", "కాలంలో")): return "time"
+    if any(w in words for w in ("ఎవరు", "ఎవరిని", "ఎవరి", "వ్యక్తి", "రచయిత", "ప్రధాని", "రాష్ట్రపతి")) or any(w.startswith("కళాకార") for w in words):
+        return "person"
+    if any(w in words for w in ("ఏది", "ఏమిటి", "ఏమి", "పేరు", "ఏ")): return "thing"
+    return "unknown"
+
+
+def _preserves_answer_type(source, candidate):
+    src, dst = _answer_type(source), _answer_type(candidate)
+    if src == dst and src != "unknown": return True
+    # Telugu often changes an explicit “ఎవరు?” into a grammatical “వ్యక్తి పేరు ఏమిటి?”.
+    if src == "person" and dst == "thing":
+        return bool(re.search(r"పేరు|వ్యక్తి|రచయిత|కళాకార", candidate))
+    return False
 
 
 def _anchor_overlap(source, candidate):
@@ -120,7 +148,7 @@ class Reformulator:
                 tokens=tokens[:tokens.index(self.eos_token_id)+1]
             else:
                 tokens=[x for x in tokens if x != self.tokenizer.pad_token_id]
-            question_type_preserved=interrogatives(question).issubset(interrogatives(text))
+            question_type_preserved=_preserves_answer_type(question, text)
             valid=self._valid(question,text,terminated=terminated)
             actions.append({"sampled_text":text,"candidate":text if valid else question,
                             "valid":valid,"terminated":terminated,"token_ids":tokens,
@@ -133,13 +161,16 @@ class Reformulator:
         if not candidate or len(candidate)>max(300,4*len(original)): return False
         if len(candidate)<2 or candidate==original: return False
         if _OUTPUT_MARKER_RE.search(candidate): return False
+        # MultiIndic's shared tokenizer may emit Bengali/Devanagari fragments for
+        # Telugu input. Do not let those actions reach the policy reward or demo.
+        if _FOREIGN_INDIC_RE.search(candidate): return False
         # Reject outputs that have collapsed into Latin/tokenizer noise. Allow
         # Latin names and numbers when the actual question remains Telugu.
         telugu_letters = len(_TELUGU_RE.findall(candidate))
         if telugu_letters < 3 or telugu_letters / max(1, len(candidate)) < .20: return False
         # Preserve the answer type (which/who/when/where/why/how) as well as
         # numeric/Latin entities; changing the interrogative changes the answer.
-        if not interrogatives(original).issubset(interrogatives(candidate)): return False
+        if not _preserves_answer_type(original, candidate): return False
         if not _anchor_overlap(original, candidate): return False
         return entity_signature(original).issubset(entity_signature(candidate))
 

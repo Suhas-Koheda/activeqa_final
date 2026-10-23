@@ -1,5 +1,18 @@
 # ActiveQA Telugu
 
+## Telugu reformulation-only REINFORCE
+
+For training the Telugu question rewriter itself, use `scripts/train_telugu_reformulation_rl.py`. This is full-parameter REINFORCE only: no supervised warm-up, no LoRA, no hand-written rewrite templates, and no QA-answer reward. Each sampled output receives a reward from token F1 against the user's reformulation references, while invalid, off-topic, answer-type-changing, foreign-script, and duplicate outputs are penalized. The script filters obvious bad pairs from the 107-question user dataset, splits by source question, writes the filtered JSONL and a rejection report, and keeps the best held-out checkpoint so a later epoch cannot silently replace a better policy.
+
+Run on a Colab T4 after cloning/pulling the repository and enabling GPU:
+
+```bash
+python scripts/train_telugu_reformulation_rl.py \
+  --config configs/colab_telugu_reformulation_rl.yaml
+```
+
+It writes `outputs/telugu_reference_reinforce.pt`, metrics, held-out generations, and filtered data under `data/indic_rag_te/rl_reference_pairs/`. To demo the resulting full model, pass that checkpoint to `scripts/demo_reformulators.py --language te --telugu-base models/hf_fresh/telugu --telugu-checkpoint outputs/telugu_reference_reinforce.pt --question "..."`. Its generated text is model output; the demo does not fill missing candidates with templates. The labels are still user-provided and not independently human verified, so the held-out generations should be reviewed before treating this policy as reliable.
+
 A research implementation of Telugu question reformulation with REINFORCE and a frozen extractive QA model. It runs on CPU for smoke tests and on a Colab GPU for the full experiment. The runtime loads models lazily when scripts execute; no model or dataset download is initiated by installation. This repository does **not** contain completed experiment results.
 
 ## Research and data limits

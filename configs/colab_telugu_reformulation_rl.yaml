@@ -1,0 +1,19 @@
+# Full-parameter REINFORCE directly rewards generated Telugu rewrites against
+# the reference reformulations. This run does not use SFT, LoRA, or QA-answer reward.
+device: cuda
+seed: 42
+cpu_threads: 4
+data:
+  eval_fraction: 0.2
+models:
+  reformulator: ai4bharat/MultiIndicParaphraseGenerationSS
+  cache_dir: models
+generation:
+  candidates_per_question: 3
+  max_input_tokens: 96
+  max_new_tokens: 48
+training:
+  reference_rl_epochs: 3
+  reference_rl_learning_rate: 0.000001
+  reference_rl_checkpoint_every: 20
+  gradient_clip_norm: 1.0
