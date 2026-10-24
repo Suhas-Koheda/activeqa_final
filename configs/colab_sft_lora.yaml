@@ -1,0 +1,39 @@
+# LoRA SFT of the Telugu reformulator on a proper (instruct-capable) base.
+#
+# Motivation (2026-10-25 pilots, raw outputs shown unfiltered):
+#   sarvam-1 (base): clean Telugu script everywhere but inconsistent behavior —
+#     copies ("రాజధాని నగరం ఏది?" drops భారతదేశ), synonym swaps, answer-type
+#     shifts, and drift into answering instead of reformulating.
+#   Navarasa Gemma-2b (instruct): clean Telugu but unstable — echoes the
+#     question at low temperature, hallucinates unrelated facts at 0.7–0.9.
+# Both need SFT before they can act as the RFT/REINFORCE policy. We pick
+# Sarvam-1 as the base: Telugu-native, 5 GB bf16 (vs 10 GB Navarasa), and its
+# paraphrases, when correct, are the cleanest of the two.
+#
+# Run in Colab: bash scripts/run_colab.sh configs/colab_sft_lora.yaml
+# Data: data/indic_rag_te/indic_paraphrase_question_pairs.jsonl (35,448 pairs)
+seed: 42
+cpu_threads: 4
+dtype: bf16
+data:
+  train_pairs_file: data/indic_rag_te/indic_paraphrase_question_pairs.jsonl
+  max_pairs_per_question: 2
+models:
+  reformulator: sarvamai/sarvam-1
+  # Local override, e.g.: --config with reformulator_path: models/sarvam-1-pilot
+  # reformulator_path: models/sarvam-1-pilot
+  cache_dir: models
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+training:
+  prompt_style: completion   # ప్రశ్న: ...\nపునర్రచన: (matches inference demos)
+  max_input_tokens: 192
+  epochs: 1
+  learning_rate: 0.0001
+  micro_batch_pairs: 4
+  grad_accum: 4
+  warmup_ratio: 0.03
+  gradient_checkpointing: true
+  output_dir: models/sarvam-reformulator-lora

@@ -6,11 +6,13 @@ cd "$ROOT_DIR"
 CONFIG_PATH="configs/colab_external_rl.yaml"
 CONFIG_SET=0
 EVAL_ONLY=0
+SFT_ONLY=0
 RESUME=0
 QUESTION=""
 while (($#)); do
   case "$1" in
     --eval-only) EVAL_ONLY=1 ;;
+    --sft-only) SFT_ONLY=1 ;;
     --resume) RESUME=1 ;;
     --smoke) CONFIG_PATH="configs/colab_external_rl_smoke.yaml"; CONFIG_SET=1 ;;
     --question)
@@ -19,7 +21,7 @@ while (($#)); do
       QUESTION="$1"
       ;;
     --help|-h)
-      echo "Usage: bash scripts/run_colab.sh [CONFIG] [--smoke] [--resume] [--eval-only] [--question TEXT]"
+      echo "Usage: bash scripts/run_colab.sh [CONFIG] [--smoke] [--resume] [--eval-only] [--sft-only] [--question TEXT]"
       exit 0
       ;;
     --*) echo "ERROR: unknown option $1" >&2; exit 2 ;;
@@ -73,7 +75,7 @@ echo "Installing Python dependencies without replacing Colab's CUDA PyTorch..."
 python -m pip install -q \
   'transformers>=4.40,<5' 'datasets>=2.19' 'rank-bm25>=0.2.2' \
   'PyYAML>=6' 'psutil>=5.9' 'tqdm>=4.66' 'safetensors>=0.4' 'scikit-learn>=1.3' \
-  'sentencepiece>=0.2.0' 'protobuf>=4.25'
+  'sentencepiece>=0.2.0' 'protobuf>=4.25' 'peft>=0.13'
 
 run_stage() {
   local stage="$1"
@@ -92,6 +94,18 @@ with open(sys.argv[1], encoding="utf-8") as stream:
     print(yaml.safe_load(stream)["training"]["checkpoint"])
 PY
 )"
+if [[ "$SFT_ONLY" == "1" || "${COLAB_SFT_ONLY:-0}" == "1" ]]; then
+  run_stage "reformulator LoRA SFT (sft-only)" python scripts/train_sft_lora.py --config "$CONFIG_PATH"
+  echo "SFT-only run complete. Adapter: $(python - "$CONFIG_PATH" <<'PY'
+import sys, yaml
+with open(sys.argv[1], encoding="utf-8") as stream:
+    cfg = yaml.safe_load(stream)
+print(cfg["training"].get("output_dir", "models/sarvam-reformulator-lora") + "/adapter")
+PY
+)"
+  exit 0
+fi
+
 if [[ "$EVAL_ONLY" == "1" || "${COLAB_EVAL_ONLY:-0}" == "1" ]]; then
   run_stage "paired evaluation (eval-only)" python scripts/evaluate.py --config "$CONFIG_PATH" --checkpoint "$CHECKPOINT_PATH"
 else
