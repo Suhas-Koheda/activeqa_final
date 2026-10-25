@@ -36,6 +36,9 @@ print(f"Working  : {ROOT}")
 
 # ── 1. install deps ───────────────────────────────────────────────────────────
 print("\n[1/5] Installing dependencies …", flush=True)
+# torchao 0.10 (pre-installed on some Colab images) is incompatible with
+# peft's LoRA dispatcher; remove it before installing peft.
+subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"])
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", "-q",
     "transformers>=4.40,<5",
@@ -123,7 +126,7 @@ if tok.pad_token_id is None:
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_PATH,
-    torch_dtype=torch.bfloat16,
+    dtype=torch.bfloat16,
     low_cpu_mem_usage=True,
     trust_remote_code=True,
 )
