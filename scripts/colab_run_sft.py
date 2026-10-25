@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Standalone Colab script: SFT-trains Sarvam-1 on Telugu paraphrase pairs,
-saves the LoRA adapter, and runs a 3-question demo.
+"""Standalone Colab SFT script.
 
-Run the entire cell below in Colab (T4 GPU runtime):
+Model  : ai4bharat/indic-bert  (271 M params, Telugu-native, trains fast on T4)
+Task   : seq2seq question reformulation via encoder-decoder LoRA
+Output : models/indic-bert-reformulator-lora/adapter/
 
-    !cd /content/activeqa_final && python scripts/colab_run_sft.py
-
-No bash wrapper needed. All steps are inline.
+Run in Colab:
+    !cd /content/activeqa_final && git pull && python scripts/colab_run_sft.py
 """
 from __future__ import annotations
 
@@ -19,57 +19,69 @@ import sys
 import time
 from pathlib import Path
 
-# ── 0. basic sanity ──────────────────────────────────────────────────────────
+# ── 0. GPU check ──────────────────────────────────────────────────────────────
 import torch
 
 if not torch.cuda.is_available():
-    sys.exit("ERROR: No GPU found. Runtime > Change runtime type > T4 GPU, then rerun.")
+    sys.exit("ERROR: No GPU. Runtime > Change runtime type > T4 GPU, then rerun.")
 
-print(f"PyTorch  : {torch.__version__}")
-print(f"CUDA     : {torch.version.cuda}")
-print(f"GPU      : {torch.cuda.get_device_name(0)}")
-print(f"VRAM     : {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GiB")
+print(f"PyTorch : {torch.__version__}")
+print(f"CUDA    : {torch.version.cuda}")
+print(f"GPU     : {torch.cuda.get_device_name(0)}")
+print(f"VRAM    : {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GiB")
 
 ROOT = Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
-print(f"Working  : {ROOT}")
+print(f"Working : {ROOT}\n")
 
-# ── 1. install deps ───────────────────────────────────────────────────────────
-print("\n[1/5] Installing dependencies …", flush=True)
-# torchao 0.10 (pre-installed on some Colab images) is incompatible with
-# peft's LoRA dispatcher; remove it before installing peft.
-subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"])
+# ── 1. deps ───────────────────────────────────────────────────────────────────
+print("[1/5] Installing dependencies …", flush=True)
+subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", "-q",
     "transformers>=4.40,<5",
-    "datasets>=2.19",
     "peft>=0.13",
-    "rank-bm25>=0.2.2",
-    "PyYAML>=6",
-    "psutil>=5.9",
-    "tqdm>=4.66",
-    "safetensors>=0.4",
-    "scikit-learn>=1.3",
     "sentencepiece>=0.2.0",
     "protobuf>=4.25",
+    "tqdm>=4.66",
     "huggingface_hub>=0.23",
-])
-print("[1/5] Done.", flush=True)
+], stdout=subprocess.DEVNULL)
+print("[1/5] Done.\n", flush=True)
 
-# ── 2. download model (skip if already on disk) ───────────────────────────────
-MODEL_ID   = "sarvamai/sarvam-1"
-MODEL_DIR  = ROOT / "models" / "sarvam-1"
-ADAPTER_DIR = ROOT / "models" / "sarvam-reformulator-lora" / "adapter"
-DATA_FILE  = ROOT / "data" / "indic_rag_te" / "indic_paraphrase_question_pairs.jsonl"
+from tqdm.auto import tqdm  # noqa: E402  (needs pip install first)
 
+# ── 2. model choice ───────────────────────────────────────────────────────────
+# ai4bharat/IndicBART  — 244 M encoder-decoder, Telugu token <2te>,
+# trains an epoch on 50k pairs in ~25 min on T4.
+# Much faster than Sarvam-1 (2.5 B) while still being Telugu-native.
+MODEL_ID  = "ai4bharat/IndicBART"
+MODEL_DIR = ROOT / "models" / "indicbart"
+ADAPTER_DIR = ROOT / "models" / "indic-bert-reformulator-lora" / "adapter"
+DATA_FILE   = ROOT / "data" / "indic_rag_te" / "indic_paraphrase_question_pairs.jsonl"
+
+SEED       = 42
+MAX_SRC    = 64
+MAX_TGT    = 64
+EPOCHS     = 1
+BATCH      = 16          # fits easily in 14 GB with a 244 M model
+LR         = 3e-4
+WARMUP     = 0.05
+LORA_R     = 16
+LORA_ALPHA = 32
+
+random.seed(SEED)
+torch.manual_seed(SEED)
+
+# ── 3. download ───────────────────────────────────────────────────────────────
 def _weights_present(d: Path) -> bool:
-    return d.is_dir() and any(d.glob("*.safetensors"))
+    return d.is_dir() and any(d.glob("*.bin")) or any(d.glob("*.safetensors")) if d.is_dir() else False
 
-if _weights_present(MODEL_DIR):
-    print(f"\n[2/5] Model weights already at {MODEL_DIR}, skipping download.", flush=True)
+if MODEL_DIR.is_dir() and (list(MODEL_DIR.glob("*.bin")) or list(MODEL_DIR.glob("*.safetensors"))):
+    print(f"[2/5] Model already at {MODEL_DIR}, skipping download.\n", flush=True)
     MODEL_PATH = str(MODEL_DIR)
 else:
-    print(f"\n[2/5] Downloading {MODEL_ID} …", flush=True)
+    print(f"[2/5] Downloading {MODEL_ID} (~1 GB) …", flush=True)
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     from huggingface_hub import snapshot_download
     MODEL_PATH = snapshot_download(
@@ -77,18 +89,12 @@ else:
         local_dir=str(MODEL_DIR),
         ignore_patterns=["*.msgpack", "flax_model*", "tf_model*", "rust_model*"],
     )
-    print(f"[2/5] Downloaded to {MODEL_PATH}", flush=True)
+    print(f"[2/5] Downloaded to {MODEL_PATH}\n", flush=True)
 
-# ── 3. load data ──────────────────────────────────────────────────────────────
-print(f"\n[3/5] Loading training pairs from {DATA_FILE} …", flush=True)
+# ── 4. load data ──────────────────────────────────────────────────────────────
+print(f"[3/5] Loading training pairs …", flush=True)
 
-MAX_PER_QUESTION = 2
-MAX_TOKENS       = 192
-SEED             = 42
-random.seed(SEED)
-torch.manual_seed(SEED)
-
-def load_pairs(path: Path, max_per_q: int) -> list[tuple[str, str]]:
+def load_pairs(path: Path) -> list[tuple[str, str]]:
     pairs: list[tuple[str, str]] = []
     with path.open(encoding="utf-8") as f:
         for line in f:
@@ -102,71 +108,85 @@ def load_pairs(path: Path, max_per_q: int) -> list[tuple[str, str]]:
                 p = rec.get("paraphrase", "")
                 if p:
                     refs = [p]
-            if not q or not refs:
-                continue
-            for r in refs[:max_per_q]:
+            for r in refs[:2]:
                 r = r.strip()
                 if r and r != q:
                     pairs.append((q, r))
     return pairs
 
-pairs = load_pairs(DATA_FILE, MAX_PER_QUESTION)
+pairs = load_pairs(DATA_FILE)
 random.shuffle(pairs)
-print(f"[3/5] Loaded {len(pairs):,} pairs.", flush=True)
+print(f"[3/5] {len(pairs):,} pairs loaded.\n", flush=True)
 
-# ── 4. SFT training ───────────────────────────────────────────────────────────
-print(f"\n[4/5] Loading model and tokenizer from {MODEL_PATH} …", flush=True)
+# ── 5. model + LoRA ───────────────────────────────────────────────────────────
+print(f"[4/5] Loading {MODEL_ID} …", flush=True)
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import LoraConfig, get_peft_model
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from peft import LoraConfig, TaskType, get_peft_model
 
-tok = AutoTokenizer.from_pretrained(MODEL_PATH, use_fast=True)
-if tok.pad_token_id is None:
-    tok.pad_token = tok.eos_token
+tok = AutoTokenizer.from_pretrained(MODEL_PATH, use_fast=False)
 
-model = AutoModelForCausalLM.from_pretrained(
+# IndicBART needs src/tgt language tokens
+SRC_LANG = "<2te>"   # Telugu source
+TGT_LANG = "<2te>"   # Telugu target
+
+model = AutoModelForSeq2SeqLM.from_pretrained(
     MODEL_PATH,
-    dtype=torch.bfloat16,
+    torch_dtype=torch.float32,   # IndicBART fp32 is fine at 244 M
     low_cpu_mem_usage=True,
-    trust_remote_code=True,
 )
-model.config.use_cache = False
-model.gradient_checkpointing_enable()
 
+# LoRA on encoder + decoder attention projections
 lora_cfg = LoraConfig(
-    r=16, lora_alpha=32, lora_dropout=0.05,
-    bias="none", task_type="CAUSAL_LM",
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    r=LORA_R,
+    lora_alpha=LORA_ALPHA,
+    lora_dropout=0.05,
+    bias="none",
+    task_type=TaskType.SEQ_2_SEQ_LM,
+    target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
 )
 model = get_peft_model(model, lora_cfg)
 model.print_trainable_parameters()
 model.to("cuda")
+print(f"[4/5] Model on GPU.\n", flush=True)
 
-# tokenize examples — loss only on the paraphrase tokens
-def make_example(q: str, p: str) -> dict | None:
-    prompt_ids = tok(f"ప్రశ్న: {q}\nపునర్రచన:", add_special_tokens=False)["input_ids"]
-    target_ids = tok(f" {p.strip()}\n",          add_special_tokens=False)["input_ids"]
-    if len(prompt_ids) + len(target_ids) > MAX_TOKENS:
-        return None
+# ── 6. tokenize ───────────────────────────────────────────────────────────────
+print("[5/5] Tokenizing …", flush=True)
+
+def encode(q: str, p: str):
+    src = tok(
+        q, max_length=MAX_SRC, truncation=True,
+        padding="max_length", return_tensors="pt",
+    )
+    with tok.as_target_tokenizer():
+        tgt = tok(
+            p, max_length=MAX_TGT, truncation=True,
+            padding="max_length", return_tensors="pt",
+        )
+    labels = tgt["input_ids"].clone()
+    labels[labels == tok.pad_token_id] = -100
     return {
-        "input_ids": prompt_ids + target_ids,
-        "labels":    [-100] * len(prompt_ids) + target_ids,
+        "input_ids":      src["input_ids"].squeeze(0),
+        "attention_mask": src["attention_mask"].squeeze(0),
+        "labels":         labels.squeeze(0),
     }
 
-examples = [e for q, p in pairs if (e := make_example(q, p)) is not None]
-skipped = len(pairs) - len(examples)
-if skipped:
-    print(f"[4/5] Skipped {skipped:,} pairs exceeding {MAX_TOKENS} tokens.", flush=True)
-print(f"[4/5] Training on {len(examples):,} examples.", flush=True)
+# set language tokens
+tok.src_lang = SRC_LANG
+if hasattr(tok, "tgt_lang"):
+    tok.tgt_lang = TGT_LANG
 
-# hyper-params
-EPOCHS     = 1
-MICRO      = 4
-ACCUM      = 4
-LR         = 1e-4
-WARMUP     = 0.03
+examples = []
+for q, p in tqdm(pairs, desc="Tokenizing", unit="pair"):
+    try:
+        examples.append(encode(q, p))
+    except Exception:
+        pass
 
-steps_per_epoch = max(1, math.ceil(len(examples) / (MICRO * ACCUM)))
+print(f"[5/5] {len(examples):,} examples ready.\n", flush=True)
+
+# ── 7. training ───────────────────────────────────────────────────────────────
+steps_per_epoch = math.ceil(len(examples) / BATCH)
 total_steps     = steps_per_epoch * EPOCHS
 warmup_steps    = max(1, int(total_steps * WARMUP))
 
@@ -175,66 +195,64 @@ opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
 def lr_lambda(s: int) -> float:
     if s < warmup_steps:
         return s / warmup_steps
-    return max(0.1, 0.5 * (1 + math.cos(
-        math.pi * (s - warmup_steps) / max(1, total_steps - warmup_steps))))
+    progress = (s - warmup_steps) / max(1, total_steps - warmup_steps)
+    return max(0.1, 0.5 * (1 + math.cos(math.pi * progress)))
 
 scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-pad_id    = tok.pad_token_id
+
 started   = time.perf_counter()
 step      = 0
 last_loss = 0.0
 
-print(f"[4/5] Training: {total_steps} optimizer steps …", flush=True)
+print(f"Training: {EPOCHS} epoch(s) × {steps_per_epoch} steps = {total_steps} total", flush=True)
 
 for epoch in range(EPOCHS):
     random.shuffle(examples)
     model.train()
-    for batch_start in range(0, len(examples), MICRO * ACCUM):
-        chunk     = examples[batch_start: batch_start + MICRO * ACCUM]
-        max_blen  = max(len(e["input_ids"]) for e in chunk)
-        input_ids = torch.full((len(chunk), max_blen), pad_id, dtype=torch.long)
-        attention  = torch.zeros((len(chunk), max_blen), dtype=torch.long)
-        labels_t   = torch.full((len(chunk), max_blen), -100, dtype=torch.long)
-        for i, e in enumerate(chunk):
-            n = len(e["input_ids"])
-            input_ids[i, :n] = torch.tensor(e["input_ids"])
-            attention[i,  :n] = 1
-            labels_t[i,   :n] = torch.tensor(e["labels"])
-        input_ids = input_ids.to("cuda")
-        attention  = attention.to("cuda")
-        labels_t   = labels_t.to("cuda")
-        out = model(input_ids=input_ids, attention_mask=attention, labels=labels_t)
-        (out.loss / ACCUM).backward()
-        if (batch_start // MICRO) % ACCUM == ACCUM - 1 or batch_start + MICRO >= len(examples):
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step(); scheduler.step(); opt.zero_grad(set_to_none=True)
-            step += 1
-            last_loss = float(out.loss.item())
-            if step % 50 == 0 or step == 1:
-                peak = torch.cuda.max_memory_allocated() / 1e9
-                rate = step / max(1e-9, time.perf_counter() - started)
-                print(f"  step {step:4d}/{total_steps}  loss={last_loss:.4f}"
-                      f"  {rate:.2f} it/s  peak={peak:.2f} GiB", flush=True)
+
+    pbar = tqdm(
+        range(0, len(examples), BATCH),
+        total=steps_per_epoch,
+        desc=f"Epoch {epoch+1}/{EPOCHS}",
+        unit="step",
+    )
+
+    for batch_start in pbar:
+        chunk = examples[batch_start: batch_start + BATCH]
+
+        input_ids = torch.stack([e["input_ids"]      for e in chunk]).to("cuda")
+        attn_mask = torch.stack([e["attention_mask"] for e in chunk]).to("cuda")
+        labels    = torch.stack([e["labels"]         for e in chunk]).to("cuda")
+
+        out = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
+        out.loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step(); scheduler.step(); opt.zero_grad(set_to_none=True)
+        step += 1
+        last_loss = float(out.loss.item())
+
+        peak = torch.cuda.max_memory_allocated() / 1e9
+        pbar.set_postfix(loss=f"{last_loss:.4f}", peak_gb=f"{peak:.1f}")
 
 elapsed = time.perf_counter() - started
-print(f"[4/5] Training done: {step} steps, {elapsed/60:.1f} min, final loss={last_loss:.4f}", flush=True)
+print(f"\nTraining done: {step} steps  {elapsed/60:.1f} min  final loss={last_loss:.4f}", flush=True)
 
-# save adapter
+# ── 8. save ───────────────────────────────────────────────────────────────────
 ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
 model.save_pretrained(str(ADAPTER_DIR))
 tok.save_pretrained(str(ADAPTER_DIR))
 metrics = {
+    "model": MODEL_ID,
     "steps": step, "examples": len(examples),
     "seconds": round(elapsed, 1), "final_loss": last_loss,
-    "base_model": MODEL_ID, "prompt_style": "completion",
 }
 (ADAPTER_DIR.parent / "sft_lora_metrics.json").write_text(
     json.dumps(metrics, indent=2), encoding="utf-8")
-print(f"[4/5] Adapter saved to {ADAPTER_DIR}", flush=True)
+print(f"Adapter  : {ADAPTER_DIR}", flush=True)
+print(f"Metrics  : {ADAPTER_DIR.parent / 'sft_lora_metrics.json'}", flush=True)
 
-# ── 5. demo ───────────────────────────────────────────────────────────────────
-print("\n[5/5] Demo — loading adapter for inference …", flush=True)
-
+# ── 9. demo ───────────────────────────────────────────────────────────────────
+print("\n── Demo ──────────────────────────────────────────────────────────────")
 model.eval()
 
 TEST_QUESTIONS = [
@@ -243,21 +261,23 @@ TEST_QUESTIONS = [
     "భారతదేశ మొదటి మహిళా ప్రధానమంత్రి ఎవరు?",
 ]
 
+forced_bos = tok.lang_code_to_id.get(TGT_LANG) if hasattr(tok, "lang_code_to_id") else None
+
 for q in TEST_QUESTIONS:
-    prompt = f"ప్రశ్న: {q}\nపునర్రచన:"
-    inputs = tok(prompt, return_tensors="pt").to("cuda")
+    enc = tok(q, return_tensors="pt", max_length=MAX_SRC, truncation=True).to("cuda")
+    gen_kwargs = dict(
+        **enc,
+        max_new_tokens=MAX_TGT,
+        num_beams=4,
+        num_return_sequences=3,
+        early_stopping=True,
+    )
+    if forced_bos is not None:
+        gen_kwargs["forced_bos_token_id"] = forced_bos
     with torch.no_grad():
-        out_ids = model.generate(
-            **inputs,
-            do_sample=True, temperature=0.7, top_p=0.9,
-            max_new_tokens=64, num_return_sequences=3,
-            pad_token_id=tok.eos_token_id,
-        )
+        out_ids = model.generate(**gen_kwargs)
     print(f"\nQ: {q}")
     for i, seq in enumerate(out_ids, 1):
-        gen = tok.decode(seq[inputs["input_ids"].shape[-1]:], skip_special_tokens=True).strip()
-        print(f"  {i}. {gen}")
+        print(f"  {i}. {tok.decode(seq, skip_special_tokens=True).strip()}")
 
-print("\n[5/5] Done.")
-print(f"Adapter  : {ADAPTER_DIR}")
-print(f"Metrics  : {ADAPTER_DIR.parent / 'sft_lora_metrics.json'}")
+print("\nDone.")
