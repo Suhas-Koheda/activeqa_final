@@ -132,7 +132,7 @@ TGT_LANG = "<2te>"   # Telugu target
 
 model = AutoModelForSeq2SeqLM.from_pretrained(
     MODEL_PATH,
-    torch_dtype=torch.float32,   # IndicBART fp32 is fine at 244 M
+    dtype=torch.float32,   # IndicBART fp32 is fine at 244 M
     low_cpu_mem_usage=True,
 )
 
@@ -265,6 +265,8 @@ forced_bos = tok.lang_code_to_id.get(TGT_LANG) if hasattr(tok, "lang_code_to_id"
 
 for q in TEST_QUESTIONS:
     enc = tok(q, return_tensors="pt", max_length=MAX_SRC, truncation=True).to("cuda")
+    # drop keys that seq2seq generate() doesn't accept
+    enc = {k: v for k, v in enc.items() if k in ("input_ids", "attention_mask")}
     gen_kwargs = dict(
         **enc,
         max_new_tokens=MAX_TGT,
