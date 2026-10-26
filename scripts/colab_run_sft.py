@@ -71,6 +71,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--lora-alpha", type=int, default=32)
     ap.add_argument("--eval-questions", type=int, default=60)
     ap.add_argument("--eval-batch", type=int, default=8)
+    ap.add_argument("--no-baseline", action="store_true",
+                    help="skip the pre-SFT held-out eval (saves a few minutes)")
+    ap.add_argument("--lora-mlp", action="store_true",
+                    help="also adapt fc1/fc2 (more capacity, more VRAM)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--skip-install", action="store_true")
     ap.add_argument("--no-cache", action="store_true")
@@ -86,8 +90,12 @@ def install_deps() -> None:
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "-q",
-        "transformers>=4.40,<5", "peft>=0.13", "sentencepiece>=0.2.0",
-        "protobuf>=4.25", "tqdm>=4.66", "huggingface_hub>=0.23",
+        # Pin: transformers 5.x pre-releases satisfy "<5" on Kaggle and load this
+        # checkpoint without aliasing model.shared.weight to the encoder/decoder/
+        # lm_head embeddings (they end up random, loss plateaus ~9, output is
+        # the same frequent-token garbage for every question).
+        "transformers==4.57.6", "peft>=0.13,<0.22", "sentencepiece>=0.2.0",
+        "protobuf>=4.25", "tqdm>=4.66", "huggingface_hub>=0.23,<1.0",
     ], stdout=subprocess.DEVNULL)
     log("[1/7] Done.")
 
@@ -211,6 +219,73 @@ def collate(batch, pad_id, device):
     return src.to(device), src_mask.to(device), labels.to(device)
 
 
+def restore_shared_embeddings(model, model_path: str) -> None:
+    """Re-tie the single checkpoint embedding into encoder/decoder/lm_head.
+
+    The checkpoint stores only ``model.shared.weight`` (64015 × 1024). Some
+    transformers builds (notably 5.x pre-releases on Kaggle, which satisfy a
+    ``<5`` spec) instantiate ``encoder.embed_tokens``, ``decoder.embed_tokens``
+    and ``lm_head`` as fresh random tensors instead of aliasing the shared
+    table, and LoRA never trains them — loss then plateaus around 9 and every
+    question decodes to the same frequent-token string.
+    """
+    import torch
+    from pathlib import Path
+
+    shared = None
+    for name in ("model.safetensors", "pytorch_model.bin"):
+        path = Path(model_path) / name
+        if not path.exists():
+            continue
+        if name.endswith(".safetensors"):
+            from safetensors import safe_open
+            with safe_open(str(path), framework="pt") as handle:
+                if "model.shared.weight" in handle.keys():
+                    shared = handle.get_tensor("model.shared.weight")
+        else:
+            state = torch.load(str(path), map_location="cpu")
+            shared = state.get("model.shared.weight")
+        if shared is not None:
+            break
+    if shared is None:
+        log("      WARNING: could not find model.shared.weight in the checkpoint; "
+            "keeping the loader's embeddings")
+        return
+
+    mismatched = []
+    with torch.no_grad():
+        model.model.shared.weight.copy_(shared)
+        for attribute in ("encoder", "decoder"):
+            holder = getattr(model.model, attribute)
+            if not torch.equal(holder.embed_tokens.weight, shared):
+                mismatched.append(attribute)
+            holder.embed_tokens.weight.copy_(shared)
+        if getattr(model, "lm_head", None) is not None:
+            if not torch.equal(model.lm_head.weight, shared):
+                mismatched.append("lm_head")
+            model.lm_head.weight.copy_(shared)
+
+    # Keep them the same Parameter objects so any later load/save stays tied.
+    model.model.encoder.embed_tokens = model.model.shared
+    model.model.decoder.embed_tokens = model.model.shared
+    if getattr(model, "lm_head", None) is not None:
+        model.lm_head.weight = model.model.shared.weight
+    model.config.tie_word_embeddings = True
+    log(f"      embeddings tied to checkpoint shared table"
+        + (f" (repaired random: {', '.join(mismatched)})" if mismatched else ""))
+
+
+def decode_candidate(tok, ids, lang_id: int, eos_id: int) -> str:
+    """Decode one generated sequence without the decoder-start or trailing EOS."""
+    tokens = ids.tolist() if hasattr(ids, "tolist") else list(ids)
+    if tokens and tokens[0] == lang_id:
+        tokens = tokens[1:]
+    if eos_id in tokens:
+        tokens = tokens[: tokens.index(eos_id)]
+    return tok.decode(tokens, skip_special_tokens=True,
+                      clean_up_tokenization_spaces=False).strip()
+
+
 def generate_one(model, tok, question, lang_id, bos_id, eos_id, max_len, device):
     import torch
     src = tok(f"{question} </s> {LANG_TOKEN}", add_special_tokens=False,
@@ -226,8 +301,48 @@ def generate_one(model, tok, question, lang_id, bos_id, eos_id, max_len, device)
     )
     with torch.inference_mode():
         out = model.generate(**src, **generate_kwargs)
-    return [tok.decode(ids, skip_special_tokens=True,
-                       clean_up_tokenization_spaces=False).strip() for ids in out]
+    return [decode_candidate(tok, ids, lang_id, eos_id) for ids in out]
+
+
+def evaluate(model, tok, eval_records, args, lang_id, bos_id, eos_id,
+             device) -> tuple[dict, list[dict]]:
+    """Generate 3 beam candidates per held-out question and summarize them."""
+    import torch
+    model.eval()
+    rows = []
+    for rec in eval_records[: args.eval_questions]:
+        candidates = generate_one(model, tok, rec["question"], lang_id,
+                                  bos_id, eos_id, args.max_tgt, device)
+        best = max(candidates, key=lambda c: max(token_f1(c, r) for r in rec["refs"]))
+        rows.append({
+            "question": rec["question"],
+            "references": rec["refs"],
+            "candidates": candidates,
+            "best": best,
+            "f1": max(token_f1(best, r) for r in rec["refs"]),
+            "copy": best.strip() == rec["question"].strip(),
+            "empty": not best.strip(),
+            "ends_question": best.strip().endswith("?"),
+            "scripts": script_stats(best),
+        })
+
+    n = max(1, len(rows))
+    summary = {
+        "eval_questions": len(rows),
+        "token_f1": round(sum(r["f1"] for r in rows) / n, 4),
+        "exact_copy_rate": round(sum(r["copy"] for r in rows) / n, 4),
+        "empty_rate": round(sum(r["empty"] for r in rows) / n, 4),
+        "ends_with_question_mark": round(sum(r["ends_question"] for r in rows) / n, 4),
+        # Collapse detector: if every question produced the same "best" output,
+        # this ratio is ~0 regardless of what the text looks like.
+        "distinct_best_ratio": round(len({r["best"] for r in rows}) / n, 4),
+        "mean_unique_candidates": round(
+            sum(len(set(r["candidates"])) for r in rows) / n, 2),
+        "tamil_spill_outputs": sum(1 for r in rows if r["scripts"]["ta"]),
+        "kannada_spill_outputs": sum(1 for r in rows if r["scripts"]["kn"]),
+        "devanagari_spill_outputs": sum(1 for r in rows if r["scripts"]["hi_deva"]),
+    }
+    return summary, rows
 
 
 def main() -> None:
@@ -271,6 +386,10 @@ def main() -> None:
 
     # ── model ────────────────────────────────────────────────────────────────
     log(f"[2/7] Model {MODEL_ID}")
+    import transformers as _transformers
+    import peft as _peft
+    log(f"      transformers {_transformers.__version__}  peft {_peft.__version__}  "
+        f"torch {torch.__version__}")
     if MODEL_DIR.is_dir() and (list(MODEL_DIR.glob("*.bin"))
                                or list(MODEL_DIR.glob("*.safetensors"))):
         model_path = str(MODEL_DIR)
@@ -311,12 +430,7 @@ def main() -> None:
         return model
 
     model = build_model()
-    lora_cfg = LoraConfig(
-        r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.05,
-        bias="none", task_type=TaskType.SEQ_2_SEQ_LM,
-        target_modules=["q_proj", "k_proj", "v_proj", "out_proj"])
-    model = get_peft_model(model, lora_cfg)
-    model.print_trainable_parameters()
+    restore_shared_embeddings(model, model_path)
     model.to(device)
 
     if use_amp and amp_dtype == torch.float16:
@@ -354,6 +468,26 @@ def main() -> None:
     train_flat = flatten_examples(train_examples)
     eval_flat = flatten_examples(eval_examples)
     log(f"      {len(train_flat):,} train pairs, {len(eval_flat)} eval pairs")
+
+    # ── baseline eval (before any LoRA weights exist) ────────────────────────
+    baseline_summary, baseline_rows = {}, []
+    if not args.no_baseline:
+        log(f"[4/7] Held-out eval — BASE model (pre-SFT), "
+            f"{len(eval_records[: args.eval_questions])} questions …")
+        baseline_summary, baseline_rows = evaluate(
+            model, tok, eval_records, args, lang_id, bos_id, eos_id, device)
+
+    # ── LoRA ─────────────────────────────────────────────────────────────────
+    targets = ["q_proj", "k_proj", "v_proj", "out_proj"]
+    if args.lora_mlp:
+        targets += ["fc1", "fc2"]
+    lora_cfg = LoraConfig(
+        r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.05,
+        bias="none", task_type=TaskType.SEQ_2_SEQ_LM,
+        target_modules=targets)
+    model = get_peft_model(model, lora_cfg)
+    model.print_trainable_parameters()
+    model.to(device)
 
     # ── train ────────────────────────────────────────────────────────────────
     steps_per_epoch = math.ceil(len(train_flat) / args.batch_size)
@@ -408,8 +542,11 @@ def main() -> None:
             losses.append(float(loss.item()))
             if step == 1:
                 log(f"      first loss {losses[0]:.4f} "
-                    f"(≈11 = random init; <1 after step 1 would mean the labels "
-                    f"leak the target)")
+                    f"(≈1.2 for this checkpoint; >6 means the token embeddings "
+                    f"did not load — see the 'embeddings tied' line above)")
+                if losses[0] > 6.0:
+                    log("      WARNING: first loss is too high for a pretrained "
+                        "paraphraser; training would learn nothing useful.")
             if step % 50 == 0 or step == total_steps:
                 avg = sum(losses[-50:]) / len(losses[-50:])
                 rate = step / max(1e-9, time.perf_counter() - started)
@@ -428,65 +565,69 @@ def main() -> None:
     tok.save_pretrained(str(out_dir))
     log(f"[6/7] Adapter saved: {out_dir}")
 
-    # ── held-out eval ────────────────────────────────────────────────────────
-    log(f"[7/7] Held-out eval on {len(eval_records[: args.eval_questions])} questions "
+    # ── held-out eval (post-SFT) ─────────────────────────────────────────────
+    log(f"[7/7] Held-out eval — SFT adapter, "
+        f"{len(eval_records[: args.eval_questions])} questions "
         f"({len(eval_flat)} references) …")
-    model.eval()
-    rows = []
-    for rec in eval_records[: args.eval_questions]:
-        candidates = generate_one(model, tok, rec["question"], lang_id,
-                                  bos_id, eos_id, args.max_tgt, device)
-        best = max(candidates, key=lambda c: max(token_f1(c, r) for r in rec["refs"]))
-        f1 = max(token_f1(best, r) for r in rec["refs"])
-        rows.append({
-            "question": rec["question"],
-            "references": rec["refs"],
-            "candidates": candidates,
-            "best": best,
-            "f1": f1,
-            "copy": best.strip() == rec["question"].strip(),
-            "empty": not best.strip(),
-            "ends_question": best.strip().endswith("?"),
-            "scripts": script_stats(best),
-        })
-
-    n = max(1, len(rows))
-    summary = {
-        "eval_questions": len(rows),
-        "token_f1": round(sum(r["f1"] for r in rows) / n, 4),
-        "exact_copy_rate": round(sum(r["copy"] for r in rows) / n, 4),
-        "empty_rate": round(sum(r["empty"] for r in rows) / n, 4),
-        "ends_with_question_mark": round(sum(r["ends_question"] for r in rows) / n, 4),
-        "tamil_spill_outputs": sum(1 for r in rows if r["scripts"]["ta"]),
-        "kannada_spill_outputs": sum(1 for r in rows if r["scripts"]["kn"]),
-        "devanagari_spill_outputs": sum(1 for r in rows if r["scripts"]["hi_deva"]),
+    summary, rows = evaluate(model, tok, eval_records, args, lang_id,
+                             bos_id, eos_id, device)
+    summary.update({
         "train_steps": step,
         "train_seconds": round(elapsed, 1),
         "final_loss": round(sum(losses[-200:]) / len(losses[-200:]), 4),
         "base_model": MODEL_ID,
+        "lora_targets": targets,
+        "trainable_params": sum(p.numel() for p in model.parameters()
+                                if p.requires_grad),
         "smoke": args.smoke,
-    }
+    })
+    if baseline_summary:
+        summary["baseline"] = baseline_summary
+        for metric in ("token_f1", "distinct_best_ratio", "exact_copy_rate",
+                       "empty_rate", "ends_with_question_mark"):
+            summary[f"delta_{metric}"] = round(
+                summary[metric] - baseline_summary[metric], 4)
+
     (out_dir.parent / "sft_metrics.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     (out_dir.parent / "sft_samples.json").write_text(
-        json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
+        json.dumps({"baseline": baseline_rows, "sft": rows},
+                   indent=2, ensure_ascii=False), encoding="utf-8")
 
     log("\n── Held-out summary ─────────────────────────────────────────────")
     for key_name, value in summary.items():
+        if key_name == "baseline":
+            continue
         log(f"  {key_name:28s} {value}")
-    if summary["empty_rate"] > 0.10 or summary["exact_copy_rate"] > 0.70:
-        log("\n  WARNING: degenerate generations (empty/copy). "
-            "Check loss curve and label shift before using this adapter.")
+    if baseline_summary:
+        log("\n── Base vs SFT (same held-out questions) ────────────────────────")
+        log(f"  {'metric':28s} {'base':>8s} {'sft':>8s} {'delta':>8s}")
+        for metric in ("token_f1", "distinct_best_ratio", "exact_copy_rate",
+                       "empty_rate", "ends_with_question_mark"):
+            log(f"  {metric:28s} {baseline_summary[metric]:>8} {summary[metric]:>8} "
+                f"{summary.get('delta_' + metric, 0):>8}")
+
+    degenerate = (summary["empty_rate"] > 0.10
+                  or summary["exact_copy_rate"] > 0.70
+                  or summary["distinct_best_ratio"] < 0.50)
+    if degenerate:
+        log("\n  WARNING: degenerate generations (empty/copy/collapse). "
+            "Check the loss curve, embedding repair line, and label shift.")
 
     log("\n── Raw samples (no filtering, no decode-time constraints) ───────")
-    for row in rows[:5]:
+    for index, row in enumerate(rows[:5]):
+        base_row = baseline_rows[index] if index < len(baseline_rows) else None
         log(f"\nQ: {row['question']}")
         for ref in row["references"][:2]:
             log(f"   ref: {ref}")
-        for index, candidate in enumerate(row["candidates"], 1):
+        if base_row:
+            cust = base_row["scripts"]
+            log(f"   base 1. {base_row['candidates'][0]}   [te={cust['te']} "
+                f"ta={cust['ta']} kn={cust['kn']} deva={cust['hi_deva']}]")
+        for candidate_index, candidate in enumerate(row["candidates"], 1):
             stats = row["scripts"]
-            log(f"   {index}. {candidate}   [te={stats['te']} ta={stats['ta']} "
-                f"kn={stats['kn']} deva={stats['hi_deva']}]")
+            log(f"   sft  {candidate_index}. {candidate}   [te={stats['te']} "
+                f"ta={stats['ta']} kn={stats['kn']} deva={stats['hi_deva']}]")
 
     log(f"\nDone. Metrics: {out_dir.parent / 'sft_metrics.json'}")
 

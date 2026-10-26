@@ -69,10 +69,18 @@ print("Download from the Output panel → activeqa_sft_artifacts.zip")
 !cd /kaggle/working/activeqa_final && python scripts/colab_run_sft.py --skip-install
 ```
 
-## What "stable output" is checked against
+## What the run proves
 
-`sft_metrics.json` fails loudly (`WARNING: degenerate generations`) if more
-than 10% of held-out outputs are empty or more than 70% are verbatim copies of
-the input question. Script purity is reported, not enforced: raw model text is
-printed with `te/ta/kn/deva` character counts so Tamil/Kannada/Devanagari spill
-is visible in the numbers rather than hidden by a filter.
+1. `first loss ≈1.2` — the checkpoint's real weights (including the tied
+   `model.shared.weight` embedding) are loaded. A first loss around 9–11 with
+   the decoder outputting the same string for every question means the
+   embedding table was re-initialized; the script pins `transformers==4.57.6`
+   and explicitly re-ties the shared embedding as a guard.
+2. `sft_metrics.json` now contains `baseline` (pre-SFT) and `delta_*` fields,
+   so improvement is measured on identical held-out questions.
+3. Degenerate output is detected via `empty_rate`, `exact_copy_rate`, and
+   `distinct_best_ratio` (≈0 means every question collapsed to the same text).
+
+Script purity is reported, not enforced: raw model text is printed with
+`te/ta/kn/deva` character counts so Tamil/Kannada/Devanagari spill is visible
+in the numbers rather than hidden by a filter.
