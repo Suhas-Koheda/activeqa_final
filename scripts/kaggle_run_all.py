@@ -49,6 +49,15 @@ def adapter_ready(directory: Path) -> bool:
         or (adapter / "adapter_model.bin").is_file())
 
 
+def stage_args(extra: str, add: tuple[str, ...] = ()) -> str:
+    """Combine pass-through options without requiring nested shell quotes."""
+    parts = shlex.split(extra)
+    for option in add:
+        if option not in parts:
+            parts.append(option)
+    return shlex.join(parts)
+
+
 def run_stage(name: str, script: Path, extra: str) -> int:
     command = [sys.executable, "-u", str(script), *shlex.split(extra)]
     print(f"\n{'=' * 72}\n{name}: {' '.join(command)}\n{'=' * 72}", flush=True)
@@ -77,15 +86,25 @@ def main() -> int:
     parser.add_argument("--sft-args", default="",
                         help="quoted options for scripts/colab_run_sft.py")
     parser.add_argument("--rl-args", default="",
-                        help="quoted options for scripts/kaggle_run_rl.py")
+                        help="options for scripts/kaggle_run_rl.py; use "
+                             '--rl-args="--questions 700 --epochs 2" (the equals '
+                             "form) so values starting with -- are not parsed "
+                             "as wrapper options")
+    parser.add_argument("--eval-only", action="store_true",
+                        help="run only the SFT-adapter selector diagnostic from "
+                             "the RL stage (no training); implies --from rl")
     args = parser.parse_args()
+    if args.eval_only:
+        if args.stage == "sft":
+            parser.error("--eval-only applies to the RL stage; use --from rl")
+        args.stage = "rl"
 
     if args.stage in ("all", "sft"):
         if args.reuse_sft and adapter_ready(SFT_DIR):
             print("Reusing the existing SFT adapter (--reuse-sft).")
         else:
             code = run_stage("STAGE 1 — SFT", ROOT / "scripts" / "colab_run_sft.py",
-                             args.sft_args)
+                             stage_args(args.sft_args))
             if code != 0:
                 print("\nSFT failed — stopping before RL. See "
                       f"{SFT_DIR / 'run.log'} for the traceback.")
@@ -110,7 +129,8 @@ def main() -> int:
                   "Run without --from rl (or with --from all) first.")
             return 2
         code = run_stage("STAGE 2 — RL", ROOT / "scripts" / "kaggle_run_rl.py",
-                         args.rl_args)
+                         stage_args(args.rl_args,
+                                    ("--eval-only",) if args.eval_only else ()))
         if code != 0:
             print("\nRL failed. The SFT adapter is still valid; see "
                   f"{RL_DIR / 'run.log'} for the traceback.")

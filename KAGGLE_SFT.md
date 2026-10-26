@@ -159,20 +159,21 @@ else:
 !cd /kaggle/working/activeqa_final && python scripts/kaggle_run_rl.py --skip-install
 ```
 
-Useful overrides:
+Useful overrides (use the `--rl-args="..."` equals form when a value starts
+with `--`; without it argparse treats the value as another wrapper option):
 
 ```python
 # faster RL pass (fewer questions, still 2 epochs)
 !... python scripts/kaggle_run_all.py --from rl --rl-args "--questions 200 --epochs 2"
 
 # diagnose selectors only (no RL training, ~2 min): margin sweep + consensus
-!... python scripts/kaggle_run_all.py --from rl --rl-args "--eval-only"
+!... python scripts/kaggle_run_all.py --from rl --eval-only
 
 # stricter RFT sample selection: only rewrites that actually beat the original
-!... python scripts/kaggle_run_all.py --from rl --rl-args "--questions 700 --epochs 2 --margin 0.05"
+!... python scripts/kaggle_run_all.py --from rl --rl-args="--questions 700 --epochs 2 --margin 0.05"
 
 # loosen selection if the run reports no qualifying rewrite
-!... python scripts/kaggle_run_all.py --from rl --rl-args "--conf-slack 0.25"
+!... python scripts/kaggle_run_all.py --from rl --rl-args="--conf-slack 0.25"
 
 # SFT overrides are forwarded the same way
 !... python scripts/kaggle_run_all.py --sft-args "--epochs 2 --lr 1.5e-4"
