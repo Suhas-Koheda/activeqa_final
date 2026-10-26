@@ -126,9 +126,11 @@ from peft import LoraConfig, TaskType, get_peft_model
 
 tok = AutoTokenizer.from_pretrained(MODEL_PATH, use_fast=False)
 
-# IndicBART needs src/tgt language tokens
-SRC_LANG = "<2te>"   # Telugu source
-TGT_LANG = "<2te>"   # Telugu target
+# IndicBART uses <2te> as the Telugu language token.
+# Look it up safely — fall back to None so generate works without forced_bos.
+_te_id = tok.convert_tokens_to_ids("<2te>")
+FORCED_BOS_ID = None if _te_id == tok.unk_token_id else _te_id
+print(f"[4/5] Telugu token <2te> -> id={_te_id}  forced_bos={FORCED_BOS_ID}", flush=True)
 
 model = AutoModelForSeq2SeqLM.from_pretrained(
     MODEL_PATH,
@@ -158,11 +160,10 @@ def encode(q: str, p: str):
         q, max_length=MAX_SRC, truncation=True,
         padding="max_length", return_tensors="pt",
     )
-    with tok.as_target_tokenizer():
-        tgt = tok(
-            p, max_length=MAX_TGT, truncation=True,
-            padding="max_length", return_tensors="pt",
-        )
+    tgt = tok(
+        text_target=p, max_length=MAX_TGT, truncation=True,
+        padding="max_length", return_tensors="pt",
+    )
     labels = tgt["input_ids"].clone()
     labels[labels == tok.pad_token_id] = -100
     return {
@@ -171,10 +172,11 @@ def encode(q: str, p: str):
         "labels":         labels.squeeze(0),
     }
 
-# set language tokens
-tok.src_lang = SRC_LANG
+# set language tokens if supported
+if hasattr(tok, "src_lang"):
+    tok.src_lang = "<2te>"
 if hasattr(tok, "tgt_lang"):
-    tok.tgt_lang = TGT_LANG
+    tok.tgt_lang = "<2te>"
 
 examples = []
 for q, p in tqdm(pairs, desc="Tokenizing", unit="pair"):
@@ -261,12 +263,9 @@ TEST_QUESTIONS = [
     "భారతదేశ మొదటి మహిళా ప్రధానమంత్రి ఎవరు?",
 ]
 
-forced_bos = tok.lang_code_to_id.get(TGT_LANG) if hasattr(tok, "lang_code_to_id") else None
-
 for q in TEST_QUESTIONS:
-    enc = tok(q, return_tensors="pt", max_length=MAX_SRC, truncation=True).to("cuda")
-    # drop keys that seq2seq generate() doesn't accept
-    enc = {k: v for k, v in enc.items() if k in ("input_ids", "attention_mask")}
+    enc = tok(q, return_tensors="pt", max_length=MAX_SRC, truncation=True)
+    enc = {k: v.to("cuda") for k, v in enc.items() if k in ("input_ids", "attention_mask")}
     gen_kwargs = dict(
         **enc,
         max_new_tokens=MAX_TGT,
@@ -274,8 +273,8 @@ for q in TEST_QUESTIONS:
         num_return_sequences=3,
         early_stopping=True,
     )
-    if forced_bos is not None:
-        gen_kwargs["forced_bos_token_id"] = forced_bos
+    if FORCED_BOS_ID is not None:
+        gen_kwargs["forced_bos_token_id"] = FORCED_BOS_ID
     with torch.no_grad():
         out_ids = model.generate(**gen_kwargs)
     print(f"\nQ: {q}")
