@@ -54,6 +54,31 @@ TELUGU = re.compile(r"[\u0C00-\u0C7F]")
 
 def log(message: str) -> None:
     print(message, flush=True)
+    path = LOG_HANDLE["path"]
+    if path:
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(str(message) + "\n")
+
+
+LOG_HANDLE: dict[str, Path | None] = {"path": None}
+
+
+def record_status(path: Path, stage: str, **fields) -> None:
+    """Persist progress so a crashed run still leaves a diagnosable trail."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {}
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            payload = {}
+    payload.update({
+        "stage": stage,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
+    payload.update(fields)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
+                    encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:
@@ -347,6 +372,11 @@ def evaluate(model, tok, eval_records, args, lang_id, bos_id, eos_id,
 
 def main() -> None:
     args = parse_args()
+    run_dir = Path(args.out).parent
+    run_dir.mkdir(parents=True, exist_ok=True)
+    LOG_HANDLE["path"] = run_dir / "run.log"
+    status_path = run_dir / "run_status.json"
+    record_status(status_path, "started", args=vars(args))
     if args.smoke:
         args.skip_install = True
         args.batch_size = min(args.batch_size, 8)
@@ -431,6 +461,7 @@ def main() -> None:
 
     model = build_model()
     restore_shared_embeddings(model, model_path)
+    record_status(status_path, "model_loaded", model_path=str(model_path))
     model.to(device)
 
     if use_amp and amp_dtype == torch.float16:
@@ -488,6 +519,7 @@ def main() -> None:
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
     model.to(device)
+    record_status(status_path, "lora_ready")
 
     # ── train ────────────────────────────────────────────────────────────────
     steps_per_epoch = math.ceil(len(train_flat) / args.batch_size)
@@ -564,6 +596,8 @@ def main() -> None:
     model.save_pretrained(str(out_dir))
     tok.save_pretrained(str(out_dir))
     log(f"[6/7] Adapter saved: {out_dir}")
+    record_status(status_path, "adapter_saved", steps=step,
+                  seconds=round(elapsed, 1))
 
     # ── held-out eval (post-SFT) ─────────────────────────────────────────────
     log(f"[7/7] Held-out eval — SFT adapter, "
@@ -571,6 +605,8 @@ def main() -> None:
         f"({len(eval_flat)} references) …")
     summary, rows = evaluate(model, tok, eval_records, args, lang_id,
                              bos_id, eos_id, device)
+    record_status(status_path, "eval_done", token_f1=summary["token_f1"],
+                  distinct_best_ratio=summary["distinct_best_ratio"])
     summary.update({
         "train_steps": step,
         "train_seconds": round(elapsed, 1),
@@ -633,4 +669,17 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        log("FAILED with traceback above")
+        path = LOG_HANDLE["path"]
+        if path:
+            try:
+                record_status(path.parent / "run_status.json", "failed",
+                              error=traceback.format_exc().strip().splitlines()[-1][:300])
+            except Exception:
+                pass
+        raise

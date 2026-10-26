@@ -49,11 +49,19 @@ print(json.dumps(m, indent=2, ensure_ascii=False))
 ## Cell 4 — download the artifacts
 
 ```python
-import shutil, os
+import os, shutil, glob
 base = "/kaggle/working/activeqa_final/models/indicbartss-reformulator-lora"
-shutil.make_archive("/kaggle/working/activeqa_sft_artifacts", "zip", base)
-print(os.path.getsize("/kaggle/working/activeqa_sft_artifacts.zip") / 1e6, "MB")
-print("Download from the Output panel → activeqa_sft_artifacts.zip")
+if os.path.isdir(base) and glob.glob(base + "/adapter/*"):
+    shutil.make_archive("/kaggle/working/activeqa_sft_artifacts", "zip", base)
+    print(round(os.path.getsize("/kaggle/working/activeqa_sft_artifacts.zip") / 1e6, 2), "MB")
+    print("Download from the Output panel → activeqa_sft_artifacts.zip")
+else:
+    print("No adapter produced — run status:")
+    status = os.path.join(base, "run_status.json")
+    print(open(status).read() if os.path.exists(status) else "(no run_status.json: Cell 2 was not run?)")
+    log = os.path.join(base, "run.log")
+    print("\n--- run.log tail ---")
+    print("".join(open(log).readlines()[-60:]) if os.path.exists(log) else "(no run.log)")
 ```
 
 ## Useful overrides
