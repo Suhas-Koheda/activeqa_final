@@ -26,10 +26,32 @@ It runs two stages in sequence on a GPU host:
 The evaluation reports the do-nothing baseline (`original_f1`), the deployed
 answer-consistent selector, a single-confident-answer corrective selector, an
 answer-consensus selector (at least two rewrites must agree on a different
-answer), and a confidence-margin sweep. A gain is only claimed when the paired
-RL − SFT interval excludes zero and the chosen selector beats the original
-question. Otherwise `verdict.recommended_action` is `original`: reformulation
-is not worth deploying for that policy.
+answer), a corrective-margin sweep, a confidence-gate sweep, and signal AUCs
+for recoverability. A gain is only claimed when the paired RL − SFT interval
+excludes zero **and** the chosen rule beats the original question with a
+paired CI above zero. Otherwise `verdict.recommended_action` is `original`:
+reformulation is not worth deploying for that policy.
+
+### Measured result (held-out `dev.jsonl`, 200 questions)
+
+| rule | F1 |
+| --- | --- |
+| original question (do nothing) | **0.7720** |
+| SFT + consistent selector (deployed default) | 0.7666 |
+| SFT + corrective, best margin (+2.0) | 0.7697 |
+| SFT + consensus | 0.7446 |
+| oracle over {original, rewrites} | 0.8372 |
+
+The oracle ceiling is real (+0.0652) and concentrated in 27 questions, but no
+deployable rule reaches it: at every corrective margin that actually switches,
+zero questions improve, and the best achievable rule is abstention. The
+question-level signal is weak (AUC 0.699 for low original confidence, 0.628 for
+confidence gain), and high confidence gain mostly indicates a *drifted* rewrite
+that the QA model answers confidently. RL fine-tuning was also negative
+(`selected_f1` 0.7666 → 0.7658 and 0.7657 in two runs). The honest deployment
+is therefore to answer the original question; the SFT adapter is kept because
+it improves paraphrase quality (token-F1 0.2698 → 0.2907) and is the base for
+future work.
 
 Artifacts: `models/indicbartss-reformulator-lora/` (SFT adapter) and
 `models/indicbartss-reformulator-lora-rl/` (RL adapter, `qa_eval.json`,

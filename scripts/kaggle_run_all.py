@@ -173,18 +173,56 @@ def main() -> int:
               f"consistent {ev['selected_f1']:.4f} | "
               f"corrective {ev['corrective_f1']:.4f} | "
               f"consensus {ev['consensus_f1']:.4f}")
+        print(f"  ceiling (original + rewrites) {ev['ceiling_f1']:.4f} "
+              f"({ev['ceiling_delta_f1']:+.4f}); "
+              f"recoverable {ev['recoverable_rate']:.3f}")
+        best_margin = ev["margin_sweep"][ev["best_margin"]]["selected_f1"]
         print(f"  best confidence margin on dev: {ev['best_margin']} "
-              f"({ev['margin_sweep'][ev['best_margin']]['selected_f1']:.4f})")
+              f"({best_margin:.4f}) — diagnostic, not a deployment claim")
+        # Only a rule whose paired CI clears zero is deployable; otherwise the
+        # sweep maximum is a number, not a result.
+        rules = {
+            "consistent": (ev["selected_f1"], ev.get("delta_ci95")),
+            "corrective": (ev["corrective_f1"],
+                           ev.get("corrective_delta_ci95")),
+            "consensus": (ev["consensus_f1"],
+                          ev.get("consensus_delta_ci95")),
+        }
+        for name, row in ev.get("corrective_sweep", {}).items():
+            rules[f"corrective@{name}"] = (row["selected_f1"],
+                                           row.get("delta_ci95"))
+        for name, row in ev.get("selective_sweep", {}).items():
+            rules[f"selective:{name}"] = (row["selected_f1"],
+                                          row.get("delta_ci95"))
+        deployable = {name: value for name, value in rules.items()
+                      if value[0] > ev["original_f1"] + 1e-9
+                      and value[1] and value[1][0] > 0}
+        if deployable:
+            best_rule = max(deployable,
+                            key=lambda name: deployable[name][0])
+            print(f"  deployable rule: {best_rule} "
+                  f"({deployable[best_rule][0]:.4f}, "
+                  f"CI[{deployable[best_rule][1][0]:+.4f},"
+                  f"{deployable[best_rule][1][1]:+.4f}])")
+        else:
+            print("  deployable rule: none — no rule clears the original with a "
+                  "CI above zero")
+            print("  DEPLOYMENT: answer the original question; do not rewrite.")
     if rl_eval:
         verdict = rl_eval["verdict"]
         print(f"RL held-out QA selected-F1: "
               f"{rl_eval['sft']['selected_f1']:.4f} → "
               f"{rl_eval['rl']['selected_f1']:.4f} "
               f"({rl_eval['delta']['selected_f1']:+.4f})")
-        print(f"Verdict: {verdict['reason']} → "
-              f"{verdict['recommended_action'].upper()} "
-              f"({verdict['best_policy']} adapter, "
-              f"{verdict['recommended_selector']} selector)")
+        if verdict.get("recommended_action") == "original":
+            print(f"Verdict: {verdict['reason']} → answer the original "
+                  f"question; no {verdict['best_policy'].upper()} selector is "
+                  f"deployable")
+        else:
+            print(f"Verdict: {verdict['reason']} → "
+                  f"{verdict['recommended_action'].upper()} "
+                  f"({verdict['best_policy']} adapter, "
+                  f"{verdict['recommended_selector']} selector)")
     print(f"Summary: {ROOT / 'models' / 'pipeline_summary.json'}")
     print("Zip models/indicbartss-reformulator-lora and "
           "models/indicbartss-reformulator-lora-rl to download every artifact.")
