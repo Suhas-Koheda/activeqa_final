@@ -90,14 +90,9 @@ run_stage() {
 run_stage "prepare data split" python scripts/prepare_data.py --config "$CONFIG_PATH"
 
 if [[ "$SFT_ONLY" == "1" || "${COLAB_SFT_ONLY:-0}" == "1" ]]; then
-  run_stage "reformulator LoRA SFT (sft-only)" python scripts/train_sft_lora.py --config "$CONFIG_PATH"
-  echo "SFT-only run complete. Adapter: $(python - "$CONFIG_PATH" <<'PY'
-import sys, yaml
-with open(sys.argv[1], encoding="utf-8") as stream:
-    cfg = yaml.safe_load(stream)
-print(cfg["training"].get("output_dir", "models/sarvam-reformulator-lora") + "/adapter")
-PY
-)"
+  run_stage "reformulator SFT (one-command pipeline)" python scripts/colab_run_sft.py
+  echo "SFT-only run complete. Adapter: models/indicbartss-reformulator-lora/adapter"
+  echo "Metrics: models/indicbartss-reformulator-lora/sft_metrics.json"
   exit 0
 fi
 
