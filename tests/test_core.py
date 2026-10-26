@@ -612,3 +612,94 @@ def test_qa_eval_reports_selective_reformulation_headroom():
     assert summary["gate_sweep"]["0.00"]["selected_f1"] == pytest.approx(1.0)
     assert summary["gate_sweep"]["1.00"]["selected_f1"] == pytest.approx(1.0)
     assert summary["best_gate"] in summary["gate_sweep"]
+
+    # Every key the eval-only report prints must exist, for any dev set.
+    assert summary["gate_sweep"]["0.00"]["gated_ceiling_f1"] == pytest.approx(1.0)
+    assert "gated_recoverable_rate" in summary["gate_sweep"]["0.00"]
+    assert set(summary["signal_auc"]) == {
+        "low_original_confidence", "confidence_gain", "rewrite_disagreement"}
+    assert summary["best_corrective_margin"] in summary["corrective_sweep"]
+    assert summary["corrective_sweep"]["0.00"]["delta_ci95"]
+    assert summary["best_selective"] in summary["selective_sweep"]
+    assert summary["selective_sweep"][summary["best_selective"]]["delta_ci95"]
+
+
+def test_auc_scores_a_ranking_signal():
+    from activeqa.qa_eval import _auc
+    # Perfect separation, reversed separation, and a single tie.
+    assert _auc([0.9, 0.8, 0.2, 0.1], [1, 1, 0, 0]) == pytest.approx(1.0)
+    assert _auc([0.1, 0.2, 0.8, 0.9], [1, 1, 0, 0]) == pytest.approx(0.0)
+    assert _auc([1.0, 1.0], [True, False]) == pytest.approx(0.5)
+    # A constant signal can never be a usable gate.
+    assert _auc([0.3, 0.3, 0.3], [1, 0, 1]) == pytest.approx(0.5)
+
+
+def test_corrective_sweep_finds_switching_margin():
+    """One wrong original is recoverable; three confident rewrites are harmful.
+
+    At margin 0 the rule switches all four and loses. At a large margin it
+    never switches and keeps the wrong original. A margin between them must
+    recover the one and refuse the three.
+    """
+    from activeqa.qa_eval import evaluate_qa_pairs, deployable_rule
+
+    class FakeReformulator:
+        def sample_actions(self, question, candidates, *args, **kwargs):
+            text = {"q1": "gold", "q2": "bb", "q3": "bb", "q4": "bb"}[question]
+            return [{"sampled_text": text, "candidate": text, "valid": True}]
+
+    class FakeQA:
+        def answer_batch(self, questions, context):
+            table = {"q1": ("a", 0.0, 0.0), "gold": ("gold", 0.0, 1.0),
+                     "q2": ("b", 0.0, 0.0), "q3": ("b", 0.0, 0.0),
+                     "q4": ("b", 0.0, 0.0), "bb": ("bb", 0.0, 0.2)}
+            return [table[question] for question in questions]
+
+    rows = [{"id": f"q{i}", "question": f"q{i}", "context": "c",
+             "answers": ["gold" if i == 1 else "b"]} for i in (1, 2, 3, 4)]
+    summary, _ = evaluate_qa_pairs(FakeReformulator(), FakeQA(), rows,
+                                   candidates=1, limit=4, label="test")
+
+    assert summary["original_f1"] == pytest.approx(0.75)
+    # Every rewrite beats the original's confidence, so margin 0 switches all.
+    assert summary["corrective_sweep"]["0.00"]["switch_rate"] == pytest.approx(1.0)
+    assert summary["corrective_sweep"]["0.00"]["selected_f1"] == pytest.approx(0.25)
+    # Large margin abstains: back to the original, wrong question included.
+    assert summary["corrective_sweep"]["5.00"]["switch_rate"] == 0.0
+    assert summary["corrective_sweep"]["5.00"]["selected_f1"] == pytest.approx(0.75)
+    # The sweet spot recovers q1 and refuses the three harmful switches.
+    assert summary["best_corrective_margin"] == "0.50"
+    assert summary["corrective_sweep"]["0.50"]["selected_f1"] == pytest.approx(1.0)
+    assert summary["corrective_sweep"]["0.50"]["switch_rate"] == pytest.approx(0.25)
+
+    # Only one of four questions is fixed, so the paired CI still includes 0.
+    rule, _ = deployable_rule(summary)
+    assert rule is None
+
+
+def test_deployable_rule_requires_a_ci_above_zero():
+    from activeqa.qa_eval import deployable_rule
+    summary = {
+        "original_f1": 0.5,
+        "selected_f1": 0.6, "delta_ci95": [0.01, 0.2],
+        "corrective_f1": 0.7, "corrective_delta_ci95": [-0.1, 0.3],
+        "consensus_f1": 0.5, "consensus_delta_ci95": [-0.05, 0.05],
+        "corrective_sweep": {"1.00": {"selected_f1": 0.65,
+                                      "delta_ci95": [0.02, 0.25]}},
+        "selective_sweep": {},
+    }
+    rule, options = deployable_rule(summary)
+    # corrective@1.00 beats consistent on F1 and both CIs are above zero.
+    assert rule == "corrective@1.00"
+    assert options["corrective"][0] == pytest.approx(0.7)
+
+    # The noisy high-F1 rule must not be picked once its CI dips below zero.
+    summary["corrective_sweep"]["1.00"]["delta_ci95"] = [-0.01, 0.25]
+    summary["delta_ci95"] = [-0.02, 0.2]
+    rule, _ = deployable_rule(summary)
+    assert rule is None
+
+    # A rule that loses to the original is never deployable, whatever its CI.
+    summary["selected_f1"] = 0.4
+    summary["delta_ci95"] = [0.01, 0.2]
+    assert deployable_rule(summary)[0] is None

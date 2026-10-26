@@ -68,6 +68,7 @@ token_f1 0.2698 → 0.2907   delta_token_f1 0.0209
   RL − SFT corrective_f1: +0.0xx paired 95% CI [...]
   RL − SFT consensus_f1: +0.0xx  paired 95% CI [...]
   SFT confidence-margin sweep: 0.00→0.7666  0.10→...  ...
+  SFT confidence-gate sweep: best q=... → ... (original ...); ceiling ...
   Original question F1: 0.7720   best policy+selector: ...
   Verdict: ... → use the SFT/RL adapter with the ... selector
 ```
@@ -83,11 +84,22 @@ Reading the RL verdict:
 - **`consensus_f1`** — switches only when at least two valid rewrites agree on
   a different answer that is more confident than the original.
 - **`generation_oracle_f1`** — best rewrite the policy produced, ignoring
-  selection. If this is below `original_f1`, no selector can help: the policy,
-  not the selector, is the bottleneck.
+  selection. If this is below `original_f1`, the rewrites alone are worse than
+  the original question, so the policy, not the selector, is the bottleneck.
+  Note that `ceiling_f1` can still exceed `original_f1` because it also lets a
+  per-question oracle keep the original.
 - **`margin_sweep`** — the consistent rule at confidence margins
   `+0.00, +0.10, +0.25, +0.50, +1.00` over the original. `best_margin` is a
   diagnostic on this dev set, not an automatically deployed setting.
+- **`corrective_sweep`** — the only rule that can fix a *wrong* original: take
+  the highest-confidence valid rewrite when it beats the original's span score
+  by a margin. It reports F1, switch/improved/harmed rates, and a paired 95% CI
+  for margins `0, 0.5, 1, 2, 3, 5, 8`. A small margin switches too often; a
+  large one abstains. The curve is the point, not one threshold.
+- **`signal_auc`** — AUC for ranking recoverable questions above the rest
+  using `low_original_confidence`, `confidence_gain`, and
+  `rewrite_disagreement`. If all three are near 0.5, no gate threshold can
+  work and a failed `gate_sweep` is not a tuning problem.
 - **`ceiling_f1`** — the best achievable score if a perfect selector could
   choose the original or the best rewrite per question. If
   `ceiling_delta_f1 <= 0`, no selection rule can beat doing nothing.
@@ -96,12 +108,19 @@ Reading the RL verdict:
   less confident than the rest. That difference is the only signal a deployable
   gate can use.
 - **`gate_sweep`** — reformulate only when the original's span confidence is
-  below a quantile, using the most confident valid rewrite inside the gate.
-  This targets uncertain originals instead of rewriting everything.
+  below a quantile. `gated_ceiling_f1` says whether the headroom is actually
+  inside that gate; if it is not above `gated_original_f1`, the gate is
+  looking in the wrong place.
+- **`selective_sweep`** — gate × corrective margin. The most conservative
+  deployable form: switch only for an uncertain original *and* only when the
+  rewrite is clearly more confident.
+- **`deployable_rule`** — the best rule whose paired CI is above zero, or
+  `None`. Sweeping thresholds on one dev set inflates the maximum, so a rule
+  only counts when its lower CI bound clears the original.
 - **paired 95% CI** — bootstrap over the per-question RL − SFT difference. A
   positive delta whose CI includes 0 needs a longer run before claiming a gain.
-- **`recommended_action`** — `original` when every policy+selector pair scores
-  below the original question, `sft`/`rl` otherwise. `harmed_rate` and
+- **`recommended_action`** — `original` when no rule clears the original with a
+  CI above zero, `sft`/`rl` otherwise. `harmed_rate` and
   `valid_generation_rate` are the stability guards behind `accepted`.
 
 ## Cell 3 — inspect the metrics

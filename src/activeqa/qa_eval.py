@@ -34,6 +34,10 @@ CONSISTENCY_FLOOR = 0.5
 CONSENSUS_FLOOR = 0.5
 CONSENSUS_MIN_SUPPORT = 2
 CONFIDENCE_MARGINS = (0.0, 0.1, 0.25, 0.5, 1.0)
+# Margins for the corrective rule: the highest-confidence valid rewrite may
+# replace the original only when it beats the original's span score by this
+# much. 0.0 switches on any improvement; large values converge to abstention.
+CORRECTIVE_MARGINS = (0.0, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0)
 
 
 def _script_counts(text):
@@ -62,6 +66,59 @@ def _quantile(values, q):
     return ordered[index]
 
 
+def _auc(scores, labels):
+    """Rank-based AUC (Mann–Whitney) for ranking positives above negatives.
+
+    This answers a question that must come before any threshold sweep: does the
+    signal order recoverable questions above the rest *at all*? An AUC of 0.5
+    means no threshold on this signal can work, so a failed sweep is not a
+    tuning problem. Uses the statistic directly, without a scipy dependency.
+    """
+    positives = [s for s, y in zip(scores, labels) if y]
+    negatives = [s for s, y in zip(scores, labels) if not y]
+    if not positives or not negatives:
+        return 0.5
+    wins = 0.0
+    for positive in positives:
+        for negative in negatives:
+            if positive > negative:
+                wins += 1.0
+            elif positive == negative:
+                wins += 0.5
+    return round(wins / (len(positives) * len(negatives)), 4)
+
+
+def deployable_rule(summary):
+    """Best selection rule whose paired delta CI excludes zero, or None.
+
+    Sweeping thresholds on one dev set inflates the maximum, so a rule is only
+    deployable when its *lower* bootstrap bound is above zero. Returns
+    ``(name, options)``; ``options`` maps every measured rule to
+    ``(f1, ci95)`` so the report can show near misses.
+    """
+    original = summary["original_f1"]
+    options = {
+        "consistent": (summary["selected_f1"], summary.get("delta_ci95")),
+        "corrective": (summary["corrective_f1"],
+                       summary.get("corrective_delta_ci95")),
+        "consensus": (summary["consensus_f1"],
+                      summary.get("consensus_delta_ci95")),
+    }
+    for margin, row in summary.get("corrective_sweep", {}).items():
+        options[f"corrective@{margin}"] = (row["selected_f1"],
+                                           row.get("delta_ci95"))
+    for key, row in summary.get("selective_sweep", {}).items():
+        options[f"selective:{key}"] = (row["selected_f1"],
+                                       row.get("delta_ci95"))
+    passing = {
+        name: value for name, value in options.items()
+        if value[0] > original + 1e-9 and value[1] and value[1][0] > 0
+    }
+    if not passing:
+        return None, options
+    return max(passing, key=lambda name: passing[name][0]), options
+
+
 def paired_delta_ci(records_a, records_b, key, samples=1000):
     """Bootstrap CI for mean(a[key] - b[key]) over aligned per-question rows.
 
@@ -83,6 +140,24 @@ def _margin_choice(answers, candidate_f1s, original_confidence, margin):
                       if cand["valid"] and cand["consistent"]
                       and cand["confidence"] >= original_confidence + margin]
     return max(eligible, key=lambda i: answers[i][2])
+
+
+def _corrective_choice(answers, candidate_f1s, original_confidence, margin):
+    """Highest-confidence valid rewrite, only past a confidence margin.
+
+    The conservative rule can never change the answer, so it cannot fix a wrong
+    original — the only case reformulation exists for. This rule can, but too
+    small a margin makes it switch constantly and lose. Sweeping the margin
+    finds out whether any amount of switching pays. Returns a 1-based index
+    into ``answers`` (0 is the original).
+    """
+    valid = [i for i, cand in enumerate(candidate_f1s) if cand["valid"]]
+    if not valid:
+        return 0
+    top = max(valid, key=lambda i: candidate_f1s[i]["confidence"])
+    if candidate_f1s[top]["confidence"] >= original_confidence + margin:
+        return top + 1
+    return 0
 
 
 def _consensus_choice(answers, candidate_f1s, original_answer,
@@ -201,6 +276,15 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
         corrective_question = texts[corrective_index]
         corrective_f1 = token_f1(answers[corrective_index][0], row["answers"])
 
+        corrective_margin_f1, corrective_margin_switch = {}, {}
+        for margin in CORRECTIVE_MARGINS:
+            key = f"{margin:.2f}"
+            index = _corrective_choice(answers, candidate_f1s,
+                                       original_confidence, margin)
+            corrective_margin_f1[key] = token_f1(answers[index][0],
+                                                 row["answers"])
+            corrective_margin_switch[key] = index != 0
+
         valid_actions = [i for i, cand in enumerate(candidate_f1s)
                          if cand["valid"]]
         best_rewrite = (max(valid_actions,
@@ -243,6 +327,18 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
             "consensus_switch": consensus_index != 0,
             "best_rewrite_index": best_rewrite,
             "best_rewrite_f1": best_rewrite_f1,
+            "best_rewrite_confidence": (
+                candidate_f1s[best_rewrite]["confidence"]
+                if best_rewrite is not None else None),
+            "confidence_gain": (
+                candidate_f1s[best_rewrite]["confidence"]
+                - original_confidence if best_rewrite is not None else 0.0),
+            "disagreement_rate": (
+                sum(1 for cand in candidate_f1s
+                    if cand["valid"] and not cand["consistent"])
+                / max(1, sum(1 for cand in candidate_f1s if cand["valid"]))),
+            "corrective_margin_f1": corrective_margin_f1,
+            "corrective_margin_switch": corrective_margin_switch,
             "candidate_f1s": [cand["f1"] for cand in candidate_f1s],
             "candidate_validity": [cand["valid"] for cand in candidate_f1s],
             "candidate_texts": [cand["text"] for cand in candidate_f1s],
@@ -338,6 +434,66 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
     summary["best_margin"] = max(
         margin_sweep, key=lambda key: margin_sweep[key]["selected_f1"])
 
+    # Corrective sweep. The conservative sweep above can never change the
+    # answer, so by construction it cannot fix a wrong original. This one can:
+    # it is the only rule with headroom toward ceiling_f1, and the question is
+    # whether some margin captures the recoverable questions without dragging
+    # in the harmless-but-wrong switches.
+    corrective_sweep = {}
+    for margin in CORRECTIVE_MARGINS:
+        key = f"{margin:.2f}"
+        values = [record["corrective_margin_f1"][key] for record in records]
+        corrective_sweep[key] = {
+            "selected_f1": round(sum(values) / n, 4),
+            "delta_f1": round(sum(values) / n - summary["original_f1"], 4),
+            "switch_rate": round(
+                sum(record["corrective_margin_switch"][key]
+                    for record in records) / n, 4),
+            "improved_rate": round(
+                sum(value > record["original_f1"] + 1e-9
+                    for value, record in zip(values, records)) / n, 4),
+            "harmed_rate": round(
+                sum(value < record["original_f1"] - 1e-9
+                    for value, record in zip(values, records)) / n, 4),
+            "delta_ci95": _bootstrap_ci(
+                [record["corrective_margin_f1"][key] - record["original_f1"]
+                 for record in records]),
+        }
+    summary["corrective_sweep"] = corrective_sweep
+    summary["best_corrective_margin"] = max(
+        corrective_sweep,
+        key=lambda key: corrective_sweep[key]["selected_f1"])
+
+    # Gate × corrective margin: reformulate only uncertain originals *and* only
+    # when the best rewrite is clearly more confident. This is the deployable
+    # form of the ceiling: abstain by default, switch rarely.
+    confidences_for_gate = [record["original_confidence"] for record in records]
+    selective_sweep = {}
+    for quantile in (0.25, 0.5, 0.75):
+        threshold = _quantile(confidences_for_gate, quantile)
+        for margin in CORRECTIVE_MARGINS:
+            margin_key = f"{margin:.2f}"
+            values, switches = [], 0
+            for record in records:
+                if (record["original_confidence"] <= threshold
+                        and record["corrective_margin_switch"][margin_key]):
+                    values.append(record["corrective_margin_f1"][margin_key])
+                    switches += 1
+                else:
+                    values.append(record["original_f1"])
+            selective_sweep[f"q{quantile:.2f}/m{margin_key}"] = {
+                "selected_f1": round(sum(values) / n, 4),
+                "delta_f1": round(sum(values) / n - summary["original_f1"], 4),
+                "switch_rate": round(switches / n, 4),
+                "delta_ci95": _bootstrap_ci(
+                    [value - record["original_f1"]
+                     for value, record in zip(values, records)]),
+            }
+    summary["selective_sweep"] = selective_sweep
+    summary["best_selective"] = max(
+        selective_sweep,
+        key=lambda key: selective_sweep[key]["selected_f1"])
+
     # ── selective reformulation ─────────────────────────────────────────────
     # Can a deployable rule (gate on the original's own span confidence) find
     # the questions where a rewrite actually beats the original? This is the
@@ -363,6 +519,20 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
     summary["nonrecoverable_original_confidence"] = round(_mean(
         [record["original_confidence"] for record in not_recoverable]), 4)
 
+    # Does any *deployable* signal rank the recoverable questions above the
+    # rest? This is the precondition for every threshold rule below; AUC 0.5
+    # means a failed sweep is not a tuning problem.
+    labels = [record["ceiling_f1"] > record["original_f1"] + 1e-9
+              for record in records]
+    summary["signal_auc"] = {
+        "low_original_confidence": _auc(
+            [-record["original_confidence"] for record in records], labels),
+        "confidence_gain": _auc(
+            [record["confidence_gain"] for record in records], labels),
+        "rewrite_disagreement": _auc(
+            [record["disagreement_rate"] for record in records], labels),
+    }
+
     confidences = [record["original_confidence"] for record in records]
     gate_sweep = {}
     for quantile in (0.0, 0.1, 0.25, 0.5, 0.75, 1.0):
@@ -375,18 +545,28 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
         values = [(record["best_rewrite_f1"]
                    if record["original_confidence"] <= threshold
                    else record["original_f1"]) for record in records]
+        gated_recoverable = [record for record in gated
+                             if record["ceiling_f1"]
+                             > record["original_f1"] + 1e-9]
         gate_sweep[f"{quantile:.2f}"] = {
             "threshold": round(threshold, 4),
             "examples": len(gated),
+            "gate_rate": round(len(gated) / n, 4),
             "selected_f1": round(sum(values) / n, 4),
             "delta_f1": round(sum(values) / n - summary["original_f1"], 4),
             "gated_original_f1": round(_mean(
                 [record["original_f1"] for record in gated]), 4),
             "gated_selected_f1": round(_mean(
                 [record["best_rewrite_f1"] for record in gated]), 4),
+            # Is the headroom actually inside this gate? If the gated ceiling
+            # is not above the gated original, no selector can help here.
+            "gated_ceiling_f1": round(_mean(
+                [record["ceiling_f1"] for record in gated]), 4),
+            "gated_recoverable_rate": round(
+                len(gated_recoverable) / max(1, len(gated)), 4),
             "switch_rate": round(sum(
                 record["best_rewrite_index"] is not None
-                for record in gated) / n, 4),
+                for record in gated) / max(1, len(gated)), 4),
             "harmed_rate": round(sum(
                 value < record["original_f1"] - 1e-9
                 for value, record in zip(values, records)) / n, 4),

@@ -240,7 +240,7 @@ def main() -> None:
 
     sys.path.insert(0, str(ROOT / "scripts"))
     from activeqa.qa_model import TeluguQA
-    from activeqa.qa_eval import evaluate_qa_pairs, paired_delta_ci
+    from activeqa.qa_eval import evaluate_qa_pairs, paired_delta_ci, deployable_rule
     from activeqa.reformulator import Reformulator
     from activeqa.rft import rft_on_policy
 
@@ -304,15 +304,46 @@ def main() -> None:
                   f"(gain {sft_eval['recoverable_mean_gain']:+.4f}, "
                   f"orig conf {sft_eval['recoverable_original_confidence']:+.2f} "
                   f"vs {sft_eval['nonrecoverable_original_confidence']:+.2f})")
+            auc = sft_eval["signal_auc"]
+            print(f"  signal AUC for recoverability: "
+                  f"low_original_conf {auc['low_original_confidence']:.3f}  "
+                  f"confidence_gain {auc['confidence_gain']:.3f}  "
+                  f"disagreement {auc['rewrite_disagreement']:.3f}")
+            print("  corrective sweep (highest-confidence rewrite past a "
+                  "confidence margin):")
+            for margin, row in sft_eval["corrective_sweep"].items():
+                print(f"    +{margin}  f1={row['selected_f1']:.4f}  "
+                      f"delta={row['delta_f1']:+.4f}  "
+                      f"CI[{row['delta_ci95'][0]:+.4f},{row['delta_ci95'][1]:+.4f}]  "
+                      f"switch={row['switch_rate']:.3f}  "
+                      f"imp={row['improved_rate']:.3f}  "
+                      f"harm={row['harmed_rate']:.3f}")
+            print(f"  best corrective margin on this dev set: "
+                  f"{sft_eval['best_corrective_margin']} "
+                  f"({sft_eval['corrective_sweep'][sft_eval['best_corrective_margin']]['selected_f1']:.4f})")
             print("  low-confidence gate sweep (best valid rewrite when the "
                   "original answer is uncertain):")
             for quantile, row in sft_eval["gate_sweep"].items():
                 print(f"    q{quantile} ≤{row['threshold']:+.3f}  "
                       f"f1={row['selected_f1']:.4f}  "
                       f"gated={row['examples']:3d}  "
-                      f"{row['gated_original_f1']:.4f}→"
-                      f"{row['gated_selected_f1']:.4f}  "
-                      f"switch={row['switch_rate']:.3f}")
+                      f"orig {row['gated_original_f1']:.4f}  "
+                      f"ceil {row['gated_ceiling_f1']:.4f}  "
+                      f"recov={row['gated_recoverable_rate']:.3f}")
+            best = sft_eval["selective_sweep"][sft_eval["best_selective"]]
+            print(f"  best gate+margin combo: {sft_eval['best_selective']}  "
+                  f"f1={best['selected_f1']:.4f} ({best['delta_f1']:+.4f})  "
+                  f"CI[{best['delta_ci95'][0]:+.4f},{best['delta_ci95'][1]:+.4f}]  "
+                  f"switch={best['switch_rate']:.3f}")
+            rule, rule_options = deployable_rule(sft_eval)
+            if rule:
+                print(f"  DEPLOYABLE RULE: {rule}  f1={rule_options[rule][0]:.4f}  "
+                      f"CI[{rule_options[rule][1][0]:+.4f},"
+                      f"{rule_options[rule][1][1]:+.4f}]  "
+                      f"(original {sft_eval['original_f1']:.4f})")
+            else:
+                print("  DEPLOYABLE RULE: none — every selector's paired 95% CI "
+                      "includes zero; do not rewrite.")
             (out_dir / "qa_eval_sft_only.json").write_text(
                 json.dumps({"sft": sft_eval}, indent=2, ensure_ascii=False),
                 encoding="utf-8")
@@ -417,18 +448,20 @@ def main() -> None:
         "corrective": best_eval["corrective_f1"],
         "consensus": best_eval["consensus_f1"],
     }
-    recommended_selector = max(selector_scores,
-                               key=selector_scores.get)
-    best_selector_f1 = selector_scores[recommended_selector]
-    beats_original = best_selector_f1 > rl_eval["original_f1"] + 1e-4
-    recommended_action = best_policy if beats_original else "original"
+    rule, rule_options = deployable_rule(best_eval)
+    best_selector_f1 = (rule_options[rule][0] if rule
+                        else max(selector_scores.values()))
+    # A swept threshold only counts as deployable when its CI excludes zero.
+    recommended_selector = rule or max(selector_scores,
+                                       key=selector_scores.get)
+    recommended_action = best_policy if rule else "original"
     if accepted:
         reason = "RL improved the held-out QA objective"
-    elif beats_original:
+    elif rule:
         reason = "RL did not beat SFT; keep the better SFT selector"
     else:
         reason = ("No reformulation policy beat the original question on "
-                  "held-out QA")
+                  "held-out QA with a CI above zero")
     verdict = {
         "accepted": accepted,
         "strict_selection_improved": strict_ok,
@@ -437,7 +470,7 @@ def main() -> None:
         "significant": significant,
         "recommended_selector": recommended_selector,
         "recommended_action": recommended_action,
-        "beats_original": beats_original,
+        "beats_original": bool(rule),
         "best_policy": best_policy,
         "best_selector_f1": round(best_selector_f1, 4),
         "original_f1": rl_eval["original_f1"],
@@ -470,14 +503,20 @@ def main() -> None:
           f"→ {sft_eval['gate_sweep'][sft_eval['best_gate']]['selected_f1']:.4f} "
           f"(original {sft_eval['original_f1']:.4f}); "
           f"ceiling {sft_eval['ceiling_f1']:.4f}")
+    print(f"  SFT corrective sweep: best margin "
+          f"{sft_eval['best_corrective_margin']} → "
+          f"{sft_eval['corrective_sweep'][sft_eval['best_corrective_margin']]['selected_f1']:.4f}  "
+          f"| best gate+margin {sft_eval['best_selective']} → "
+          f"{sft_eval['selective_sweep'][sft_eval['best_selective']]['selected_f1']:.4f}")
+    print(f"  Deployable rule (CI above zero): {rule or 'none'}")
     print(f"  Original question F1: {rl_eval['original_f1']:.4f}   "
           f"best policy+selector: {best_selector_f1:.4f} "
           f"({best_policy}/{recommended_selector})")
     print(f"  Verdict: {verdict['reason']} → use the {best_policy.upper()} "
           f"adapter with the {recommended_selector} selector")
     if recommended_action == "original":
-        print("  DEPLOYMENT: do not rewrite. Every policy+selector pair scores "
-              "below the original question on this held-out set.")
+        print("  DEPLOYMENT: do not rewrite. No selector clears the original "
+              "question with a CI above zero on this held-out set.")
     if accepted and not significant:
         print("  NOTE: the change is positive but its paired 95% CI includes 0; "
               "rerun with more --questions / --epochs before claiming a gain.")
