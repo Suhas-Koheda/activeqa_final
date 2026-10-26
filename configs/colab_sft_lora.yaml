@@ -11,12 +11,13 @@
 # paraphrases, when correct, are the cleanest of the two.
 #
 # Run in Colab: bash scripts/run_colab.sh configs/colab_sft_lora.yaml
-# Data: data/indic_rag_te/indic_paraphrase_question_pairs.jsonl (35,448 pairs)
+# Data: data/indic_rag_te/sft_pairs_v2.jsonl (29,753 pairs; includes the
+# nlpctx/telugu-qa-codemixed tier, used as-is — see scripts/build_sft_dataset.py)
 seed: 42
 cpu_threads: 4
 dtype: bf16
 data:
-  train_pairs_file: data/indic_rag_te/indic_paraphrase_question_pairs.jsonl
+  train_pairs_file: data/indic_rag_te/sft_pairs_v2.jsonl
   max_pairs_per_question: 2
 models:
   reformulator: sarvamai/sarvam-1

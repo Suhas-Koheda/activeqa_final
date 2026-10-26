@@ -42,7 +42,7 @@ os.chdir(ROOT)
 MODEL_ID = "ai4bharat/MultiIndicParaphraseGenerationSS"
 MODEL_DIR = ROOT / "models" / "MultiIndicParaphraseGenerationSS"
 ADAPTER_DIR = ROOT / "models" / "indicbartss-reformulator-lora" / "adapter"
-DATA_FILE = ROOT / "data" / "indic_rag_te" / "indic_paraphrase_question_pairs.jsonl"
+DATA_FILE = ROOT / "data" / "indic_rag_te" / "sft_pairs_v2.jsonl"
 CACHE_DIR = ROOT / "models" / ".sft_cache"
 
 LANG_TOKEN = "<2te>"
