@@ -42,6 +42,8 @@ Watch for these lines:
 
 ```
 GPU: Tesla T4  14.6 GiB  amp=auto
+[1/7] transformers 5.16.1 -> 4.57.6; restarting with the pinned build …
+[1/7] transformers 4.57.6 already installed.
 embeddings tied to checkpoint shared table
 AMP probe (float16): loss=nan finite=False
 non-finite under autocast -> training in fp32
@@ -203,3 +205,13 @@ traceback. For RL, look at
   `--candidates`.
 - `SFT adapter not found` — the SFT stage did not finish; run without
   `--from rl`, or check the SFT `run_status.json`.
+- `First loss ... is far too high` — the checkpoint embeddings did not load.
+  Kaggle now preinstalls transformers 5.x, which loads this checkpoint with
+  random encoder/decoder embeddings; a version check for ">= 4.57" accepts it.
+  Both scripts now install the exact pin **before** importing transformers and
+  restart the process, then the SFT stage aborts instead of writing a collapsed
+  adapter. If you see this, the environment was built with `--skip-install`;
+  rerun in a fresh process without it.
+- `SFT produced a collapsed adapter` — the SFT metrics show
+  `distinct_best_ratio < 0.5` or `token_f1 == 0`; the orchestrator stops before
+  RL so a broken adapter cannot poison the RL stage.

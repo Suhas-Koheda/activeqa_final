@@ -37,6 +37,7 @@ os.chdir(ROOT)
 sys.path.insert(0, str(ROOT / "src"))
 
 MODEL_ID = "ai4bharat/MultiIndicParaphraseGenerationSS"
+PINNED_TRANSFORMERS = "4.57.6"
 LOCAL_MODEL_DIR = ROOT / "models" / "MultiIndicParaphraseGenerationSS"
 QA_MODEL = "l3cube-pune/telugu-question-answering-squad-bert"
 SFT_ADAPTER = ROOT / "models" / "indicbartss-reformulator-lora" / "adapter"
@@ -108,24 +109,40 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-def ensure_deps() -> None:
+def installed_transformers() -> str:
+    """Version on disk. Must be checked before importing transformers."""
     try:
-        import peft  # noqa: F401
-        import transformers
-        major = int(transformers.__version__.split(".")[0])
-        if major >= 4 and int(transformers.__version__.split(".")[1]) >= 57:
-            return
+        from importlib.metadata import version
+        return version("transformers")
     except Exception:
-        pass
-    log("[deps] installing pinned transformers/peft …")
+        return ""
+
+
+def ensure_deps() -> None:
+    """Install the exact pin, then restart before transformers is imported.
+
+    Kaggle now preinstalls transformers 5.x. A ">= 4.57" check accepts it, but
+    5.x loads this checkpoint without tying its shared embedding table, which
+    collapses every output to the same string. Only an exact version match is
+    safe, and the restart avoids keeping already-imported 5.x modules alive.
+    """
+    current = installed_transformers()
+    if current == PINNED_TRANSFORMERS:
+        log(f"[deps] transformers {current} already installed")
+        return
+    log(f"[deps] installing transformers {PINNED_TRANSFORMERS} "
+        f"(found {current or 'none'}) …")
     subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "-q",
-        "transformers==4.57.6", "peft>=0.13,<0.22", "sentencepiece>=0.2.0",
-        "protobuf>=4.25", "tqdm>=4.66", "huggingface_hub>=0.23,<1.0",
+        f"transformers=={PINNED_TRANSFORMERS}", "peft>=0.13,<0.22",
+        "sentencepiece>=0.2.0", "protobuf>=4.25", "tqdm>=4.66",
+        "huggingface_hub>=0.23,<1.0",
     ], stdout=subprocess.DEVNULL)
-    log("[deps] done")
+    log("[deps] done; restarting so the pinned build is the one imported")
+    os.execv(sys.executable,
+             [sys.executable, str(Path(__file__).resolve())] + sys.argv[1:])
 
 
 def resolve_model_path() -> str:
@@ -175,7 +192,7 @@ def main() -> None:
     record_status(status_path, "started", args=vars(args))
 
     if args.smoke:
-        args.skip_install = True
+        args.skip_install = installed_transformers() == PINNED_TRANSFORMERS
         args.questions = 2
         args.epochs = 1
         args.candidates = 2
@@ -196,6 +213,12 @@ def main() -> None:
         ensure_deps()
     import transformers
     import peft
+    if (transformers.__version__ != PINNED_TRANSFORMERS
+            and not args.smoke):
+        raise SystemExit(
+            f"transformers {transformers.__version__} is loaded but this "
+            f"pipeline requires {PINNED_TRANSFORMERS}. Rerun without "
+            "--skip-install (or reinstall the pin) in a fresh process.")
     log(f"[1/6] RL stage — transformers {transformers.__version__}  "
         f"peft {peft.__version__}  torch {torch.__version__}")
 

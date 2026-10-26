@@ -46,6 +46,7 @@ DATA_FILE = ROOT / "data" / "indic_rag_te" / "indic_paraphrase_question_pairs.js
 CACHE_DIR = ROOT / "models" / ".sft_cache"
 
 LANG_TOKEN = "<2te>"
+PINNED_TRANSFORMERS = "4.57.6"
 TAMIL = re.compile(r"[\u0B80-\u0BFF]")
 KANNADA = re.compile(r"[\u0C80-\u0CFF]")
 DEVANAGARI = re.compile(r"[\u0900-\u097F]")
@@ -104,6 +105,9 @@ def parse_args() -> argparse.Namespace:
                     help="auto probes fp16 and falls back to fp32 on non-finite loss")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--skip-install", action="store_true")
+    ap.add_argument("--allow-high-loss", action="store_true",
+                    help="continue even if the first loss is implausibly high "
+                         "(only for intentional from-scratch training)")
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--smoke", action="store_true",
                     help="CPU-friendly sanity run: 256 pairs, 12 steps, no install")
@@ -111,6 +115,15 @@ def parse_args() -> argparse.Namespace:
 
 
 # ── install ──────────────────────────────────────────────────────────────────
+def installed_transformers() -> str:
+    """Version on disk. Must be checked before importing transformers."""
+    try:
+        from importlib.metadata import version
+        return version("transformers")
+    except Exception:
+        return ""
+
+
 def install_deps() -> None:
     log("[1/7] Installing dependencies (torchao is pinned too old by Colab for peft) …")
     subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"],
@@ -390,9 +403,33 @@ def main() -> None:
         if "SMOKE_STEPS" not in os.environ:
             os.environ["SMOKE_STEPS"] = "12"
 
+    # Install BEFORE importing transformers. Kaggle now ships transformers
+    # 5.16.1, and importing it first keeps that module in memory even if pip
+    # then writes 4.57.6 to disk: the checkpoint loses its tied embeddings,
+    # loss starts around 400, and every question decodes to the same string.
+    if not args.skip_install:
+        current = installed_transformers()
+        if current != PINNED_TRANSFORMERS:
+            install_deps()
+            log(f"[1/7] transformers {current or 'missing'} -> "
+                f"{PINNED_TRANSFORMERS}; restarting with the pinned build …")
+            os.execv(sys.executable,
+                     [sys.executable, str(Path(__file__).resolve())] + sys.argv[1:])
+        else:
+            log(f"[1/7] transformers {current} already installed.")
+    else:
+        log("[1/7] Skipping dependency install (--skip-install).")
+
     import torch
     from transformers import AutoModelForSeq2SeqLM, AlbertTokenizer
     from peft import LoraConfig, TaskType, get_peft_model
+    import transformers as _version_check
+    if (_version_check.__version__ != PINNED_TRANSFORMERS
+            and not args.skip_install):
+        raise SystemExit(
+            f"transformers {_version_check.__version__} is loaded but this "
+            f"pipeline requires {PINNED_TRANSFORMERS}. Rerun without "
+            "--skip-install (or reinstall the pin) in a fresh process.")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -410,11 +447,6 @@ def main() -> None:
             f"amp={args.amp}")
     else:
         log("No GPU -> CPU smoke mode (correctness check only, not a real run).")
-
-    if not args.skip_install:
-        install_deps()
-    else:
-        log("[1/7] Skipping dependency install (--skip-install).")
 
     # ── model ────────────────────────────────────────────────────────────────
     log(f"[2/7] Model {MODEL_ID}")
@@ -615,6 +647,15 @@ def main() -> None:
                 log(f"      first loss {losses[0]:.4f} "
                     f"(≈1.2 for this checkpoint; >6 means the token embeddings "
                     f"did not load — see the 'embeddings tied' line above)")
+                if losses[0] > 50.0 and not args.allow_high_loss:
+                    raise SystemExit(
+                        f"First loss {losses[0]:.1f} is far too high for the "
+                        "pretrained paraphraser (expected ~1.2-2.7). The "
+                        "checkpoint embeddings did not load, usually because "
+                        "transformers 5.x was imported before the 4.57.6 pin. "
+                        "Aborting before writing a collapsed adapter; rerun "
+                        "with a clean process (or pass --allow-high-loss only "
+                        "if you really are training from scratch).")
                 if losses[0] > 6.0:
                     log("      WARNING: first loss is too high for a pretrained "
                         "paraphraser; training would learn nothing useful.")

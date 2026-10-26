@@ -94,6 +94,16 @@ def main() -> int:
                 print("\nSFT exited successfully but produced no adapter. "
                       f"Check {SFT_DIR / 'run_status.json'} and run.log.")
                 return 2
+            metrics = load_json(SFT_DIR / "sft_metrics.json") or {}
+            collapsed = (metrics.get("distinct_best_ratio", 1.0) < 0.5
+                         or metrics.get("token_f1", 1.0) == 0.0)
+            if collapsed:
+                print("\nSFT produced a collapsed adapter (token_f1="
+                      f"{metrics.get('token_f1')}, distinct_best_ratio="
+                      f"{metrics.get('distinct_best_ratio')}). Stopping before "
+                      "RL. Most likely transformers 5.x was active instead of "
+                      f"4.57.6; see {SFT_DIR / 'run.log'}.")
+                return 3
     if args.stage in ("all", "rl"):
         if not adapter_ready(SFT_DIR):
             print(f"\nNo SFT adapter at {SFT_DIR / 'adapter'}. "
