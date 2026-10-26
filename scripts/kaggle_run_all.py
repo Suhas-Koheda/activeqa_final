@@ -117,10 +117,20 @@ def main() -> int:
             return code
 
     sft_metrics = load_json(SFT_DIR / "sft_metrics.json")
-    rl_eval = load_json(RL_DIR / "qa_eval.json")
+    qa_path = RL_DIR / "qa_eval.json"
+    sft_only_path = RL_DIR / "qa_eval_sft_only.json"
+    # A --eval-only run writes qa_eval_sft_only.json. Prefer it when it is newer
+    # than qa_eval.json so the summary never shows stale RL numbers as fresh.
+    eval_only = (sft_only_path.exists()
+                 and (not qa_path.exists()
+                      or sft_only_path.stat().st_mtime
+                      > qa_path.stat().st_mtime))
+    rl_eval = None if eval_only else load_json(qa_path)
+    sft_only = load_json(sft_only_path) if eval_only else None
     summary = {
         "sft_metrics": sft_metrics,
         "qa_eval": rl_eval,
+        "sft_selector_diagnostics": sft_only,
         "artifacts": {
             "sft_adapter": str(SFT_DIR / "adapter"),
             "rl_adapter": str(RL_DIR / "adapter"),
@@ -136,13 +146,25 @@ def main() -> int:
               f"{sft_metrics.get('baseline', {}).get('token_f1', float('nan')):.4f} "
               f"→ {sft_metrics.get('token_f1', float('nan')):.4f}   "
               f"(optimizer steps {sft_metrics.get('optimizer_steps', '?')})")
+    if sft_only:
+        ev = sft_only["sft"]
+        print("Selector-only diagnostic (no RL training this run):")
+        print(f"  original {ev['original_f1']:.4f} | "
+              f"consistent {ev['selected_f1']:.4f} | "
+              f"corrective {ev['corrective_f1']:.4f} | "
+              f"consensus {ev['consensus_f1']:.4f}")
+        print(f"  best confidence margin on dev: {ev['best_margin']} "
+              f"({ev['margin_sweep'][ev['best_margin']]['selected_f1']:.4f})")
     if rl_eval:
         verdict = rl_eval["verdict"]
         print(f"RL held-out QA selected-F1: "
               f"{rl_eval['sft']['selected_f1']:.4f} → "
               f"{rl_eval['rl']['selected_f1']:.4f} "
               f"({rl_eval['delta']['selected_f1']:+.4f})")
-        print(f"Verdict: {verdict['reason']} → {verdict['best_policy'].upper()} adapter")
+        print(f"Verdict: {verdict['reason']} → "
+              f"{verdict['recommended_action'].upper()} "
+              f"({verdict['best_policy']} adapter, "
+              f"{verdict['recommended_selector']} selector)")
     print(f"Summary: {ROOT / 'models' / 'pipeline_summary.json'}")
     print("Zip models/indicbartss-reformulator-lora and "
           "models/indicbartss-reformulator-lora-rl to download every artifact.")

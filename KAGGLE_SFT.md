@@ -60,23 +60,39 @@ token_f1 0.2698 → 0.2907   delta_token_f1 0.0209
   metric                              SFT        RL     delta
   original_f1                      ...
   selected_f1                      ...
+  corrective_f1                    ...
+  consensus_f1                     ...
   generation_oracle_f1             ...
   ...
-  RL − SFT selected_f1: +0.0xx   95% CI [...]
-  Verdict: ... → use the SFT/RL adapter
+  RL − SFT selected_f1: +0.0xx   paired 95% CI [...]
+  RL − SFT corrective_f1: +0.0xx paired 95% CI [...]
+  RL − SFT consensus_f1: +0.0xx  paired 95% CI [...]
+  SFT confidence-margin sweep: 0.00→0.7666  0.10→...  ...
+  Original question F1: 0.7720   best policy+selector: ...
+  Verdict: ... → use the SFT/RL adapter with the ... selector
 ```
 
 Reading the RL verdict:
 
-- **`selected_f1`** — deployable held-out QA token-F1 after confidence selection.
-  This is the objective.
+- **`original_f1`** — the do-nothing baseline: answer the original question.
+  A reformulation policy is only useful if its best selector beats this.
+- **`selected_f1`** — the currently deployed rule (answer-consistent rewrite,
+  highest span confidence). This is the primary deployable number.
+- **`corrective_f1`** — lets a single high-confidence rewrite change the
+  answer. Higher ceiling, more risk.
+- **`consensus_f1`** — switches only when at least two valid rewrites agree on
+  a different answer that is more confident than the original.
 - **`generation_oracle_f1`** — best rewrite the policy produced, ignoring
-  selection. If this rises but `selected_f1` does not, the selector is the
-  bottleneck; if it does not rise, the policy itself did not improve.
-- **`delta_ci95`** — paired bootstrap interval over dev questions. A positive
-  delta whose CI includes 0 needs a longer run before claiming a gain.
-- **`harmed_rate` / `valid_generation_rate` / `distinct_selected_ratio`** —
-  the stability guards behind `accepted`.
+  selection. If this is below `original_f1`, no selector can help: the policy,
+  not the selector, is the bottleneck.
+- **`margin_sweep`** — the consistent rule at confidence margins
+  `+0.00, +0.10, +0.25, +0.50, +1.00` over the original. `best_margin` is a
+  diagnostic on this dev set, not an automatically deployed setting.
+- **paired 95% CI** — bootstrap over the per-question RL − SFT difference. A
+  positive delta whose CI includes 0 needs a longer run before claiming a gain.
+- **`recommended_action`** — `original` when every policy+selector pair scores
+  below the original question, `sft`/`rl` otherwise. `harmed_rate` and
+  `valid_generation_rate` are the stability guards behind `accepted`.
 
 ## Cell 3 — inspect the metrics
 
@@ -149,8 +165,14 @@ Useful overrides:
 # faster RL pass (fewer questions, still 2 epochs)
 !... python scripts/kaggle_run_all.py --from rl --rl-args "--questions 200 --epochs 2"
 
-# stricter / looser RFT sample selection
-!... python scripts/kaggle_run_all.py --from rl --rl-args "--margin 0.05 --conf-slack 0.0"
+# diagnose selectors only (no RL training, ~2 min): margin sweep + consensus
+!... python scripts/kaggle_run_all.py --from rl --rl-args "--eval-only"
+
+# stricter RFT sample selection: only rewrites that actually beat the original
+!... python scripts/kaggle_run_all.py --from rl --rl-args "--questions 700 --epochs 2 --margin 0.05"
+
+# loosen selection if the run reports no qualifying rewrite
+!... python scripts/kaggle_run_all.py --from rl --rl-args "--conf-slack 0.25"
 
 # SFT overrides are forwarded the same way
 !... python scripts/kaggle_run_all.py --sft-args "--epochs 2 --lr 1.5e-4"
@@ -163,10 +185,15 @@ Useful overrides:
 - Sampling and teacher-forced scoring are batched across 8 questions per
   `generate()` / forward pass, which is what keeps RL to minutes on a T4.
 - RFT updates only on rewrites that (a) pass the validity gate, (b) score at
-  least as well as the original question under the QA model, and (c) are within
-  `--conf-slack` of the original span confidence. Batches with no qualifying
-  rewrite are skipped instead of pushing every sample down (the failure mode of
-  the earlier all-negative REINFORCE runs).
+  least as well as the original question under the QA model, and (c) are at
+  least as confident as the original (`--conf-slack` defaults to `0.0`, which
+  matches the deployed selector). Batches with no qualifying rewrite are
+  skipped instead of pushing every sample down (the failure mode of the earlier
+  all-negative REINFORCE runs).
+- Evaluation reports three selectors and a confidence-margin sweep, and
+  bootstraps **RL − SFT** per question. The old interval compared each policy
+  against the original, which is a different quantity and could look
+  significant while the actual RL−SFT difference was not.
 - The validity gate was relaxed to what it is for — stability, not semantic
   judging. It now rejects only unfinished/empty/copy outputs, foreign-script
   spill, Latin/tokenizer noise, changed *known* answer types, and rewrites that
@@ -200,7 +227,9 @@ traceback. For RL, look at
 `models/indicbartss-reformulator-lora-rl/run.log`. Common causes:
 
 - `No qualifying rewrite was found` — too strict selection or too few
-  candidates; lower `--margin`, raise `--conf-slack`, or raise `--candidates`.
+  candidates; lower `--margin`, raise `--conf-slack` above 0, or raise
+  `--candidates`. This is a safe outcome (the SFT adapter is kept), not a
+  corrupted one.
 - CUDA OOM during RL — lower `--generate-batch` (generation batch) or
   `--candidates`.
 - `SFT adapter not found` — the SFT stage did not finish; run without

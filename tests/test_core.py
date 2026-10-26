@@ -504,3 +504,73 @@ def test_rft_skips_when_no_rewrite_beats_the_original():
     assert metrics["optimizer_steps"] == 0
     assert metrics["selected_rate"] == 0.0
     assert records == []
+
+
+def test_qa_eval_margin_sweep_and_answer_consensus():
+    """Consensus can correct a wrong original; margins can suppress harm.
+
+    Q1: the original is wrong and two rewrites agree on a different (correct)
+    answer. The conservative rule must abstain; consensus must switch.
+
+    Q2: a consistent rewrite is only slightly more confident than the
+    original. The default rule switches; a +0.25 margin must not.
+    """
+    from activeqa.qa_eval import evaluate_qa_pairs
+
+    class FakeReformulator:
+        def sample_actions(self, question, candidates, *args, **kwargs):
+            table = {
+                "q_consensus": ["gold", "gold", "other"],
+                "q_margin": ["delhi government announced", "delhi government announced"],
+            }
+            return [{"sampled_text": text, "candidate": text,
+                     "valid": not (question == "q_margin" and text.endswith("announced")
+                                   and index == 1)}
+                    for index, text in enumerate(table[question])]
+
+    class FakeQA:
+        def answer_batch(self, questions, context):
+            table = {
+                "q_consensus": ("wrong", 0.0, -1.0),
+                "gold": ("gold", 0.0, -0.4),
+                "other": ("elsewhere", 0.0, -0.05),
+                "q_margin": ("delhi government", 0.0, -1.0),
+                "delhi government announced": ("delhi government announced",
+                                               0.0, -0.9),
+            }
+            return [table.get(question, ("wrong", 0.0, -1.0)) for question in questions]
+
+    summary, records = evaluate_qa_pairs(
+        FakeReformulator(), FakeQA(),
+        [{"id": "c", "question": "q_consensus", "context": "c",
+          "answers": ["gold"]},
+         {"id": "m", "question": "q_margin", "context": "c",
+          "answers": ["delhi government announced"]}],
+        candidates=3, limit=2, label="test")
+
+    by_id = {record["id"]: record for record in records}
+    # Conservative rule cannot correct a wrong original.
+    assert by_id["c"]["selected_f1"] == 0.0
+    assert by_id["c"]["switched"] is False
+    # Consensus uses the two agreeing rewrites.
+    assert by_id["c"]["consensus_switch"] is True
+    assert by_id["c"]["consensus_f1"] == pytest.approx(1.0)
+    # The lone high-confidence wrong answer never becomes the consensus.
+    assert by_id["c"]["consensus_question"] == "gold"
+
+    assert by_id["m"]["selected_f1"] == pytest.approx(1.0)
+    assert summary["margin_sweep"]["0.00"]["selected_f1"] == pytest.approx(0.5)
+    assert summary["margin_sweep"]["0.00"]["switch_rate"] == pytest.approx(0.5)
+    assert summary["margin_sweep"]["0.25"]["selected_f1"] == pytest.approx(0.4)
+    assert summary["margin_sweep"]["0.25"]["switch_rate"] == 0.0
+    assert summary["best_margin"] == "0.00"
+    assert summary["consensus_f1"] == pytest.approx(1.0)
+    assert summary["consensus_switch_rate"] == pytest.approx(1.0)
+    assert summary["consensus_harmed_rate"] == 0.0
+
+
+def test_paired_ci_is_computed_on_rl_minus_sft_differences():
+    from activeqa.qa_eval import paired_delta_ci
+    sft = [{"selected_f1": 0.0}, {"selected_f1": 0.5}, {"selected_f1": 1.0}]
+    rl = [{"selected_f1": 0.1}, {"selected_f1": 0.6}, {"selected_f1": 1.1}]
+    assert paired_delta_ci(rl, sft, "selected_f1") == [0.1, 0.1]

@@ -91,8 +91,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--lr", type=float, default=7e-5)
     ap.add_argument("--margin", type=float, default=0.0,
                     help="required reward gain over the original question")
-    ap.add_argument("--conf-slack", type=float, default=0.25,
-                    help="allowed confidence deficit vs the original question")
+    ap.add_argument("--conf-slack", type=float, default=0.0,
+                    help="allowed confidence deficit vs the original question "
+                         "(0.0 matches the deployed selector; positive values "
+                         "train on rewrites deployment would not choose)")
     ap.add_argument("--max-input", type=int, default=96)
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--eval-questions", type=int, default=200)
@@ -102,6 +104,9 @@ def parse_args() -> argparse.Namespace:
                          "the original's answer (reported as corrective_f1)")
     ap.add_argument("--no-eval", action="store_true",
                     help="skip both held-out QA evaluations (fast training only)")
+    ap.add_argument("--eval-only", action="store_true",
+                    help="evaluate the SFT adapter and the selector sweep on the "
+                         "held-out set, then stop (no RL training)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--skip-install", action="store_true")
     ap.add_argument("--smoke", action="store_true",
@@ -172,9 +177,10 @@ def load_rows(path: str, limit: int, seed: int) -> list[dict]:
 
 
 def paired_table(sft: dict, rl: dict) -> str:
-    keys = ("original_f1", "selected_f1", "corrective_f1",
+    keys = ("original_f1", "selected_f1", "corrective_f1", "consensus_f1",
             "generation_oracle_f1", "improved_rate", "harmed_rate",
             "switch_rate", "corrective_switch_rate", "corrective_harmed_rate",
+            "consensus_switch_rate", "consensus_harmed_rate",
             "valid_generation_rate", "distinct_selected_ratio")
     lines = [f"  {'metric':28s} {'SFT':>9s} {'RL':>9s} {'delta':>9s}"]
     for key in keys:
@@ -234,7 +240,7 @@ def main() -> None:
 
     sys.path.insert(0, str(ROOT / "scripts"))
     from activeqa.qa_model import TeluguQA
-    from activeqa.qa_eval import evaluate_qa_pairs
+    from activeqa.qa_eval import evaluate_qa_pairs, paired_delta_ci
     from activeqa.reformulator import Reformulator
     from activeqa.rft import rft_on_policy
 
@@ -272,6 +278,32 @@ def main() -> None:
         log(f"      SFT selected_f1={sft_eval['selected_f1']:.4f} "
             f"(original {sft_eval['original_f1']:.4f}, "
             f"generation oracle {sft_eval['generation_oracle_f1']:.4f})")
+        if args.eval_only:
+            print("\n── SFT selector diagnostics (no training) ─────────────────────")
+            print(f"  original question        {sft_eval['original_f1']:.4f}")
+            print(f"  consistent (deployed)    {sft_eval['selected_f1']:.4f}  "
+                  f"switch={sft_eval['switch_rate']:.3f}  "
+                  f"harmed={sft_eval['harmed_rate']:.3f}")
+            print(f"  confident correction     {sft_eval['corrective_f1']:.4f}  "
+                  f"switch={sft_eval['corrective_switch_rate']:.3f}  "
+                  f"harmed={sft_eval['corrective_harmed_rate']:.3f}")
+            print(f"  answer consensus         {sft_eval['consensus_f1']:.4f}  "
+                  f"switch={sft_eval['consensus_switch_rate']:.3f}  "
+                  f"harmed={sft_eval['consensus_harmed_rate']:.3f}")
+            print("  confidence-margin sweep (consistent rule):")
+            for margin, row in sft_eval["margin_sweep"].items():
+                print(f"    +{margin}  f1={row['selected_f1']:.4f}  "
+                      f"switch={row['switch_rate']:.3f}  "
+                      f"harmed={row['harmed_rate']:.3f}")
+            print(f"  best margin on this dev set: {sft_eval['best_margin']} "
+                  f"(diagnostic only; confirm on a second split)")
+            (out_dir / "qa_eval_sft_only.json").write_text(
+                json.dumps({"sft": sft_eval}, indent=2, ensure_ascii=False),
+                encoding="utf-8")
+            record_status(status_path, "eval_only_done",
+                          selected_f1=sft_eval["selected_f1"],
+                          consensus_f1=sft_eval["consensus_f1"])
+            return
 
     # ── RL ───────────────────────────────────────────────────────────────────
     train_rows = load_rows(args.train, args.questions, args.seed)
@@ -333,6 +365,12 @@ def main() -> None:
 
     delta = rl_eval["selected_f1"] - sft_eval["selected_f1"]
     corrective_delta = rl_eval["corrective_f1"] - sft_eval["corrective_f1"]
+    consensus_delta = rl_eval["consensus_f1"] - sft_eval["consensus_f1"]
+    # RL − SFT must be bootstrapped on the per-question difference, not on each
+    # policy's difference from the original (those are different quantities).
+    selected_ci = paired_delta_ci(rl_records, sft_records, "selected_f1")
+    corrective_ci = paired_delta_ci(rl_records, sft_records, "corrective_f1")
+    consensus_ci = paired_delta_ci(rl_records, sft_records, "consensus_f1")
     stable = (rl_eval["valid_generation_rate"] >= sft_eval["valid_generation_rate"] - 0.05
               and rl_eval["distinct_selected_ratio"] >= 0.50
               and rl_eval["tamil_spill_outputs"] == 0
@@ -345,20 +383,52 @@ def main() -> None:
                          and rl_eval["corrective_harmed_rate"]
                          <= sft_eval["corrective_harmed_rate"] + 0.05
                          and stable)
-    accepted = strict_ok or corrective_ok
-    recommended_selector = ("consistent" if strict_ok and delta >= corrective_delta
-                            else ("confidence_override" if corrective_ok
-                                  else "consistent"))
+    consensus_ok = bool(consensus_delta > 0
+                        and rl_eval["consensus_harmed_rate"]
+                        <= sft_eval["consensus_harmed_rate"] + 0.05
+                        and stable)
+    accepted = strict_ok or corrective_ok or consensus_ok
+    significant = bool(selected_ci[0] > 0 or corrective_ci[0] > 0
+                       or consensus_ci[0] > 0)
+
+    best_policy = "rl" if accepted else "sft"
+    best_eval = rl_eval if accepted else sft_eval
+    selector_scores = {
+        "consistent": best_eval["selected_f1"],
+        "corrective": best_eval["corrective_f1"],
+        "consensus": best_eval["consensus_f1"],
+    }
+    recommended_selector = max(selector_scores,
+                               key=selector_scores.get)
+    best_selector_f1 = selector_scores[recommended_selector]
+    beats_original = best_selector_f1 > rl_eval["original_f1"] + 1e-4
+    recommended_action = best_policy if beats_original else "original"
+    if accepted:
+        reason = "RL improved the held-out QA objective"
+    elif beats_original:
+        reason = "RL did not beat SFT; keep the better SFT selector"
+    else:
+        reason = ("No reformulation policy beat the original question on "
+                  "held-out QA")
     verdict = {
         "accepted": accepted,
         "strict_selection_improved": strict_ok,
         "corrective_selection_improved": corrective_ok,
-        "significant": bool(rl_eval["delta_ci95"][0] > 0
-                            or rl_eval["corrective_delta_ci95"][0] > 0),
+        "consensus_selection_improved": consensus_ok,
+        "significant": significant,
         "recommended_selector": recommended_selector,
-        "reason": ("RL improved held-out QA" if accepted else
-                   "RL did not improve either selection rule"),
-        "best_policy": "rl" if accepted else "sft",
+        "recommended_action": recommended_action,
+        "beats_original": beats_original,
+        "best_policy": best_policy,
+        "best_selector_f1": round(best_selector_f1, 4),
+        "original_f1": rl_eval["original_f1"],
+        "delta": {"selected_f1": round(delta, 4),
+                  "corrective_f1": round(corrective_delta, 4),
+                  "consensus_f1": round(consensus_delta, 4)},
+        "paired_ci95": {"selected_f1": selected_ci,
+                        "corrective_f1": corrective_ci,
+                        "consensus_f1": consensus_ci},
+        "reason": reason,
         "sft_adapter": str(sft_adapter),
         "rl_adapter": str(adapter_dir),
     }
@@ -366,18 +436,27 @@ def main() -> None:
     print("\n── Held-out QA: original vs selected reformulation ──────────────")
     print(paired_table(sft_eval, rl_eval))
     print(f"\n  Consistent selector   RL − SFT selected_f1: {delta:+.4f}   "
-          f"95% CI [{rl_eval['delta_ci95'][0]:+.4f}, "
-          f"{rl_eval['delta_ci95'][1]:+.4f}]")
+          f"paired 95% CI [{selected_ci[0]:+.4f}, {selected_ci[1]:+.4f}]")
     print(f"  Confident correction  RL − SFT corrective_f1: {corrective_delta:+.4f}   "
-          f"95% CI [{rl_eval['corrective_delta_ci95'][0]:+.4f}, "
-          f"{rl_eval['corrective_delta_ci95'][1]:+.4f}] "
+          f"paired 95% CI [{corrective_ci[0]:+.4f}, {corrective_ci[1]:+.4f}] "
           f"(override ≥ {rl_eval['confidence_override']})")
+    print(f"  Answer consensus      RL − SFT consensus_f1: {consensus_delta:+.4f}   "
+          f"paired 95% CI [{consensus_ci[0]:+.4f}, {consensus_ci[1]:+.4f}]")
     print(f"  Policy quality (generation oracle): "
           f"{rl_eval['generation_oracle_f1'] - sft_eval['generation_oracle_f1']:+.4f}")
-    print(f"  Verdict: {verdict['reason']} → use the {verdict['best_policy'].upper()} "
+    print("  SFT confidence-margin sweep: " + "  ".join(
+        f"{margin}→{row['selected_f1']:.4f}"
+        for margin, row in sft_eval["margin_sweep"].items()))
+    print(f"  Original question F1: {rl_eval['original_f1']:.4f}   "
+          f"best policy+selector: {best_selector_f1:.4f} "
+          f"({best_policy}/{recommended_selector})")
+    print(f"  Verdict: {verdict['reason']} → use the {best_policy.upper()} "
           f"adapter with the {recommended_selector} selector")
-    if accepted and not verdict["significant"]:
-        print("  NOTE: the change is positive but its 95% CI includes 0; "
+    if recommended_action == "original":
+        print("  DEPLOYMENT: do not rewrite. Every policy+selector pair scores "
+              "below the original question on this held-out set.")
+    if accepted and not significant:
+        print("  NOTE: the change is positive but its paired 95% CI includes 0; "
               "rerun with more --questions / --epochs before claiming a gain.")
     if not accepted:
         print("  The RL adapter is kept for inspection; downstream runs should keep "
@@ -403,9 +482,12 @@ def main() -> None:
         "sft": sft_eval,
         "rl": rl_eval,
         "delta": {"selected_f1": round(delta, 4),
+                  "corrective_f1": round(corrective_delta, 4),
+                  "consensus_f1": round(consensus_delta, 4),
                   "generation_oracle_f1": round(
                       rl_eval["generation_oracle_f1"]
                       - sft_eval["generation_oracle_f1"], 4)},
+        "paired_ci95": verdict["paired_ci95"],
         "verdict": verdict,
         "training": metrics,
     }, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -414,6 +496,8 @@ def main() -> None:
     }, indent=2, ensure_ascii=False), encoding="utf-8")
     record_status(status_path, "finished", accepted=accepted,
                   best_policy=verdict["best_policy"],
+                  recommended_action=verdict["recommended_action"],
+                  recommended_selector=verdict["recommended_selector"],
                   delta_selected_f1=round(delta, 4))
     log(f"\nDone. Metrics: {out_dir / 'qa_eval.json'}")
 

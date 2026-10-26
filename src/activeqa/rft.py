@@ -8,9 +8,9 @@ closes that gap with the frozen Telugu QA model as the reward:
 2. Answer the original question and every rewrite on the same passage.
 3. Keep rewrites that are valid, score at least as well as the original
    (``margin``), and whose answer span is at least as confident as the
-   original's (``confidence_slack``). The latter aligns training with the
-   deployable confidence selector: a rewrite that only wins under gold answers
-   but never wins the selector would not change held-out QA.
+   original's (``confidence_slack``, default 0.0 because the deployed selector
+   only switches on ``confidence > original``). Training on rewrites the
+   selector would never pick does not change held-out QA.
 4. Teacher-force the best qualifying rewrite, accumulating until
    ``batch_questions`` targets, then take one optimizer step.
 
@@ -38,7 +38,7 @@ def _chunks(items, size):
 
 def rft_on_policy(ref, qa, rows, *, candidates=6, batch_questions=8,
                   epochs=1, learning_rate=7e-5, margin=0.0,
-                  confidence_slack=0.25, max_input=96, max_new=64,
+                  confidence_slack=0.0, max_input=96, max_new=64,
                   do_sample=True, seed=42, generate_batch=8,
                   max_updates=None, log=print):
     """Run RFT on ``rows`` (dicts with question/context/answers).

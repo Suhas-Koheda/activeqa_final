@@ -31,6 +31,9 @@ KANNADA = re.compile(r"[\u0C80-\u0CFF]")
 DEVANAGARI = re.compile(r"[\u0900-\u097F]")
 
 CONSISTENCY_FLOOR = 0.5
+CONSENSUS_FLOOR = 0.5
+CONSENSUS_MIN_SUPPORT = 2
+CONFIDENCE_MARGINS = (0.0, 0.1, 0.25, 0.5, 1.0)
 
 
 def _script_counts(text):
@@ -52,6 +55,71 @@ def _bootstrap_ci(deltas, samples=1000):
             round(boots[int(0.975 * samples) - 1], 4)]
 
 
+def paired_delta_ci(records_a, records_b, key, samples=1000):
+    """Bootstrap CI for mean(a[key] - b[key]) over aligned per-question rows.
+
+    ``summary["delta_ci95"]`` compares one policy against the original
+    question. That is not the interval for RL − SFT, where both policies are
+    evaluated on the same rows and their per-question difference must be
+    bootstrapped directly.
+    """
+    if len(records_a) != len(records_b):
+        raise ValueError("paired CI needs the same rows for both policies")
+    return _bootstrap_ci(
+        [float(a[key]) - float(b[key]) for a, b in zip(records_a, records_b)],
+        samples=samples)
+
+
+def _margin_choice(answers, candidate_f1s, original_confidence, margin):
+    """Conservative rule with an extra confidence margin over the original."""
+    eligible = [0] + [i + 1 for i, cand in enumerate(candidate_f1s)
+                      if cand["valid"] and cand["consistent"]
+                      and cand["confidence"] >= original_confidence + margin]
+    return max(eligible, key=lambda i: answers[i][2])
+
+
+def _consensus_choice(answers, candidate_f1s, original_answer,
+                      original_confidence):
+    """Pick a rewrite answer agreed on by at least two valid rewrites.
+
+    The conservative rule can never correct a wrong original, because it
+    requires the rewrite's answer to match the original's. The confidence
+    override can switch, but a single confident wrong answer is enough to hurt
+    (see ``corrective_f1``). Consensus is the middle ground: switch only when
+    several independent rewrites land on the same different answer, and that
+    answer is more confident than the original. Returns a 0-based index into
+    ``candidate_f1s`` or None.
+    """
+    valid = [i for i, cand in enumerate(candidate_f1s) if cand["valid"]]
+    if len(valid) < CONSENSUS_MIN_SUPPORT:
+        return None
+    clusters = []
+    for index in valid:
+        cand = candidate_f1s[index]
+        for cluster in clusters:
+            if token_f1(cand["answer"],
+                        [cluster[0]["answer"]]) >= CONSENSUS_FLOOR:
+                cluster.append({**cand, "index": index})
+                break
+        else:
+            clusters.append([{**cand, "index": index}])
+    best = None
+    for cluster in clusters:
+        if len(cluster) < CONSENSUS_MIN_SUPPORT:
+            continue
+        # Same-answer clusters are already covered by the conservative rule.
+        if token_f1(cluster[0]["answer"],
+                    [original_answer]) >= CONSISTENCY_FLOOR:
+            continue
+        leader = max(cluster, key=lambda cand: cand["confidence"])
+        if leader["confidence"] <= original_confidence:
+            continue
+        rank = (leader["confidence"], len(cluster))
+        if best is None or rank > best[0]:
+            best = (rank, leader["index"])
+    return None if best is None else best[1]
+
+
 def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
                       max_input=96, max_new=64, do_sample=True,
                       confidence_override=0.5,
@@ -63,8 +131,12 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
     ``corrective_f1`` additionally lets the single highest-confidence rewrite
     replace the original when it beats the original's confidence by
     ``confidence_override``. That is the case reformulation exists for (the
-    original question produced a wrong span), but it is also the riskier case,
-    so both numbers are reported instead of silently changing deployment.
+    original question produced a wrong span), but it is also the riskier case.
+    ``consensus_f1`` switches only when at least two valid rewrites agree on a
+    different answer that is more confident than the original.
+    ``margin_sweep`` reports the conservative rule at several confidence
+    margins over the original, so deployment does not have to guess a
+    threshold. All are reported; none silently replaces the deployed rule.
     """
     rows = list(rows[:limit] if limit else rows)
     if not rows:
@@ -98,12 +170,18 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
         # always eligible; a rewrite must be valid and keep an answer that is
         # consistent with the original question's answer. Highest span
         # confidence wins, so this matches deployment.
-        eligible = [0] + [i + 1 for i, cand in enumerate(candidate_f1s)
-                          if cand["valid"] and cand["consistent"]]
-        best = max(eligible, key=lambda i: answers[i][2])
+        best = _margin_choice(answers, candidate_f1s, original_confidence, 0.0)
         selected_question = texts[best]
         selected_answer, selected_confidence = answers[best][0], answers[best][2]
         selected_f1 = token_f1(selected_answer, row["answers"])
+
+        margin_f1, margin_switch = {}, {}
+        for margin in CONFIDENCE_MARGINS:
+            key = f"{margin:.2f}"
+            index = _margin_choice(answers, candidate_f1s,
+                                   original_confidence, margin)
+            margin_f1[key] = token_f1(answers[index][0], row["answers"])
+            margin_switch[key] = index != 0
 
         valid_indices = [i + 1 for i, cand in enumerate(candidate_f1s)
                          if cand["valid"]]
@@ -115,6 +193,14 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
         corrective_index = corrective if corrective is not None else best
         corrective_question = texts[corrective_index]
         corrective_f1 = token_f1(answers[corrective_index][0], row["answers"])
+
+        consensus = _consensus_choice(answers, candidate_f1s, original_answer,
+                                      original_confidence)
+        # _consensus_choice returns a 0-based candidate index; texts/answers
+        # put the original question at 0.
+        consensus_index = consensus + 1 if consensus is not None else best
+        consensus_question = texts[consensus_index]
+        consensus_f1 = token_f1(answers[consensus_index][0], row["answers"])
 
         valid_f1s = [cand["f1"] for cand in candidate_f1s if cand["valid"]]
         oracle_f1 = max(valid_f1s) if valid_f1s else original_f1
@@ -135,9 +221,16 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
             "corrective_switch": corrective_index != 0,
             "original_confidence": original_confidence,
             "selected_confidence": selected_confidence,
+            "consensus_f1": consensus_f1,
+            "consensus_question": consensus_question,
+            "consensus_switch": consensus_index != 0,
             "candidate_f1s": [cand["f1"] for cand in candidate_f1s],
             "candidate_validity": [cand["valid"] for cand in candidate_f1s],
             "candidate_texts": [cand["text"] for cand in candidate_f1s],
+            "candidate_answers": [cand["answer"] for cand in candidate_f1s],
+            "candidate_confidences": [cand["confidence"] for cand in candidate_f1s],
+            "margin_f1": margin_f1,
+            "margin_switch": margin_switch,
             "generation_oracle_f1": oracle_f1,
             "valid": True if best == 0 else candidate_f1s[best - 1]["valid"],
             "scripts": scripts,
@@ -159,6 +252,7 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
         "original_f1": round(sum(r["original_f1"] for r in records) / n, 4),
         "selected_f1": round(sum(r["selected_f1"] for r in records) / n, 4),
         "corrective_f1": round(sum(r["corrective_f1"] for r in records) / n, 4),
+        "consensus_f1": round(sum(r["consensus_f1"] for r in records) / n, 4),
         "generation_oracle_f1": round(
             sum(r["generation_oracle_f1"] for r in records) / n, 4),
         "improved_rate": round(
@@ -170,6 +264,12 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
             sum(r["corrective_switch"] for r in records) / n, 4),
         "corrective_harmed_rate": round(
             sum(r["corrective_f1"] < r["original_f1"] - 1e-9 for r in records) / n, 4),
+        "consensus_switch_rate": round(
+            sum(r["consensus_switch"] for r in records) / n, 4),
+        "consensus_harmed_rate": round(
+            sum(r["consensus_f1"] < r["original_f1"] - 1e-9 for r in records) / n, 4),
+        "consensus_improved_rate": round(
+            sum(r["consensus_f1"] > r["original_f1"] + 1e-9 for r in records) / n, 4),
         "confidence_override": confidence_override,
         "mean_confidence_delta": round(
             sum(r["selected_confidence"] - r["original_confidence"]
@@ -187,12 +287,36 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
     summary["delta_f1"] = round(summary["selected_f1"] - summary["original_f1"], 4)
     summary["corrective_delta_f1"] = round(
         summary["corrective_f1"] - summary["original_f1"], 4)
+    summary["consensus_delta_f1"] = round(
+        summary["consensus_f1"] - summary["original_f1"], 4)
     summary["delta_ci95"] = _bootstrap_ci(
         [record["selected_f1"] - record["original_f1"] for record in records])
     summary["corrective_delta_ci95"] = _bootstrap_ci(
         [record["corrective_f1"] - record["original_f1"] for record in records])
+    summary["consensus_delta_ci95"] = _bootstrap_ci(
+        [record["consensus_f1"] - record["original_f1"] for record in records])
     summary["generation_oracle_delta"] = round(
         summary["generation_oracle_f1"] - summary["original_f1"], 4)
+
+    margin_sweep = {}
+    for margin in CONFIDENCE_MARGINS:
+        key = f"{margin:.2f}"
+        values = [record["margin_f1"][key] for record in records]
+        margin_sweep[key] = {
+            "selected_f1": round(sum(values) / n, 4),
+            "delta_f1": round(sum(values) / n - summary["original_f1"], 4),
+            "switch_rate": round(
+                sum(record["margin_switch"][key] for record in records) / n, 4),
+            "improved_rate": round(
+                sum(value > record["original_f1"] + 1e-9
+                    for value, record in zip(values, records)) / n, 4),
+            "harmed_rate": round(
+                sum(value < record["original_f1"] - 1e-9
+                    for value, record in zip(values, records)) / n, 4),
+        }
+    summary["margin_sweep"] = margin_sweep
+    summary["best_margin"] = max(
+        margin_sweep, key=lambda key: margin_sweep[key]["selected_f1"])
     summary["switched_mean_lift"] = round(
         sum(r["selected_f1"] - r["original_f1"] for r in switched)
         / max(1, len(switched)), 4)

@@ -21,7 +21,15 @@ It runs two stages in sequence on a GPU host:
    `l3cube-pune/telugu-question-answering-squad-bert` model as the reward. It
    then answers 200 held-out `dev.jsonl` questions with the original question
    and with the confidence-selected rewrite, for the SFT and RL policies, and
-   reports the paired delta plus a bootstrap confidence interval.
+   reports the paired RL − SFT delta with a per-question bootstrap interval.
+
+The evaluation reports the do-nothing baseline (`original_f1`), the deployed
+answer-consistent selector, a single-confident-answer corrective selector, an
+answer-consensus selector (at least two rewrites must agree on a different
+answer), and a confidence-margin sweep. A gain is only claimed when the paired
+RL − SFT interval excludes zero and the chosen selector beats the original
+question. Otherwise `verdict.recommended_action` is `original`: reformulation
+is not worth deploying for that policy.
 
 Artifacts: `models/indicbartss-reformulator-lora/` (SFT adapter) and
 `models/indicbartss-reformulator-lora-rl/` (RL adapter, `qa_eval.json`,

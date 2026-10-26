@@ -40,9 +40,10 @@ training:
   learning_rate: 0.00007
   batch_questions: 8
   min_reward_margin: 0.0
-  # Allow a rewrite to be taught even if its span confidence is up to 0.25
-  # lower than the original's; 0.0 is stricter but selects fewer samples.
-  confidence_slack: 0.25
+  # 0.0 matches the deployed selector: only rewrites whose span confidence is
+  # at least the original's are taught. Positive values train on rewrites the
+  # selector would never choose.
+  confidence_slack: 0.0
   optimizer: adamw
   weight_decay: 0.0
   gradient_clip_norm: 1.0
