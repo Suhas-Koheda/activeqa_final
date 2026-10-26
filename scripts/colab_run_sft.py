@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Standalone Colab SFT script.
+"""Standalone Colab SFT script — LoRA fine-tune IndicBARTSS on Telugu question
+reformulation pairs.
 
-Model  : ai4bharat/indic-bert  (271 M params, Telugu-native, trains fast on T4)
-Task   : seq2seq question reformulation via encoder-decoder LoRA
-Output : models/indic-bert-reformulator-lora/adapter/
+Model : ai4bharat/MultiIndicParaphraseGenerationSS
+  - 244 M encoder-decoder (same family as IndicBART)
+  - Uses AlbertTokenizer with keep_accents=True
+  - Handles NATIVE Telugu script directly (no Devanagari conversion needed)
+  - Input format : "<s> Question </s> <2te>"  (add_special_tokens=False)
+  - Target format: "<2te> Reformulation </s>" (add_special_tokens=False)
+  - decoder_start_token_id = lang_token_id(<2te>)
 
-Run in Colab:
+Run in Colab (T4 GPU):
     !cd /content/activeqa_final && git pull && python scripts/colab_run_sft.py
 """
 from __future__ import annotations
@@ -26,7 +31,6 @@ if not torch.cuda.is_available():
     sys.exit("ERROR: No GPU. Runtime > Change runtime type > T4 GPU, then rerun.")
 
 print(f"PyTorch : {torch.__version__}")
-print(f"CUDA    : {torch.version.cuda}")
 print(f"GPU     : {torch.cuda.get_device_name(0)}")
 print(f"VRAM    : {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GiB")
 
@@ -49,22 +53,19 @@ subprocess.check_call([
 ], stdout=subprocess.DEVNULL)
 print("[1/5] Done.\n", flush=True)
 
-from tqdm.auto import tqdm  # noqa: E402  (needs pip install first)
+from tqdm.auto import tqdm  # noqa: E402
 
-# ── 2. model choice ───────────────────────────────────────────────────────────
-# ai4bharat/IndicBART  — 244 M encoder-decoder, Telugu token <2te>,
-# trains an epoch on 50k pairs in ~25 min on T4.
-# Much faster than Sarvam-1 (2.5 B) while still being Telugu-native.
-MODEL_ID  = "ai4bharat/IndicBART"
-MODEL_DIR = ROOT / "models" / "indicbart"
-ADAPTER_DIR = ROOT / "models" / "indic-bert-reformulator-lora" / "adapter"
+# ── 2. config ─────────────────────────────────────────────────────────────────
+MODEL_ID    = "ai4bharat/MultiIndicParaphraseGenerationSS"
+MODEL_DIR   = ROOT / "models" / "MultiIndicParaphraseGenerationSS"
+ADAPTER_DIR = ROOT / "models" / "indicbartss-reformulator-lora" / "adapter"
 DATA_FILE   = ROOT / "data" / "indic_rag_te" / "indic_paraphrase_question_pairs.jsonl"
 
+LANG_TOKEN = "<2te>"
 SEED       = 42
-MAX_SRC    = 64
-MAX_TGT    = 64
+MAX_LEN    = 128    # covers most Telugu questions + reformulations
 EPOCHS     = 1
-BATCH      = 16          # fits easily in 14 GB with a 244 M model
+BATCH      = 16
 LR         = 3e-4
 WARMUP     = 0.05
 LORA_R     = 16
@@ -74,9 +75,6 @@ random.seed(SEED)
 torch.manual_seed(SEED)
 
 # ── 3. download ───────────────────────────────────────────────────────────────
-def _weights_present(d: Path) -> bool:
-    return d.is_dir() and any(d.glob("*.bin")) or any(d.glob("*.safetensors")) if d.is_dir() else False
-
 if MODEL_DIR.is_dir() and (list(MODEL_DIR.glob("*.bin")) or list(MODEL_DIR.glob("*.safetensors"))):
     print(f"[2/5] Model already at {MODEL_DIR}, skipping download.\n", flush=True)
     MODEL_PATH = str(MODEL_DIR)
@@ -92,7 +90,7 @@ else:
     print(f"[2/5] Downloaded to {MODEL_PATH}\n", flush=True)
 
 # ── 4. load data ──────────────────────────────────────────────────────────────
-print(f"[3/5] Loading training pairs …", flush=True)
+print("[3/5] Loading training pairs …", flush=True)
 
 def load_pairs(path: Path) -> list[tuple[str, str]]:
     pairs: list[tuple[str, str]] = []
@@ -121,69 +119,94 @@ print(f"[3/5] {len(pairs):,} pairs loaded.\n", flush=True)
 # ── 5. model + LoRA ───────────────────────────────────────────────────────────
 print(f"[4/5] Loading {MODEL_ID} …", flush=True)
 
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoModelForSeq2SeqLM, AlbertTokenizer
 from peft import LoraConfig, TaskType, get_peft_model
 
-tok = AutoTokenizer.from_pretrained(MODEL_PATH, use_fast=False)
+# IndicBARTSS requires AlbertTokenizer with keep_accents=True
+# This preserves Telugu Unicode codepoints correctly
+tok = AlbertTokenizer.from_pretrained(
+    MODEL_PATH, do_lower_case=False, use_fast=False, keep_accents=True)
 
-# IndicBART uses <2te> as the Telugu language token.
-# Look it up safely — fall back to None so generate works without forced_bos.
-_te_id = tok.convert_tokens_to_ids("<2te>")
-FORCED_BOS_ID = None if _te_id == tok.unk_token_id else _te_id
-print(f"[4/5] Telugu token <2te> -> id={_te_id}  forced_bos={FORCED_BOS_ID}", flush=True)
+# get special token ids the official way
+bos_id = tok._convert_token_to_id_with_added_voc("<s>")
+eos_id = tok._convert_token_to_id_with_added_voc("</s>")
+pad_id = tok._convert_token_to_id_with_added_voc("<pad>")
+lang_id = tok._convert_token_to_id_with_added_voc(LANG_TOKEN)
+print(f"  bos={bos_id} eos={eos_id} pad={pad_id} lang(<2te>)={lang_id}", flush=True)
 
 model = AutoModelForSeq2SeqLM.from_pretrained(
     MODEL_PATH,
-    dtype=torch.float32,   # IndicBART fp32 is fine at 244 M
+    torch_dtype=torch.float32,
     low_cpu_mem_usage=True,
 )
+model.config.use_cache = False
 
-# LoRA on encoder + decoder attention projections
+# LoRA — target the attention projections
 lora_cfg = LoraConfig(
     r=LORA_R,
     lora_alpha=LORA_ALPHA,
     lora_dropout=0.05,
     bias="none",
     task_type=TaskType.SEQ_2_SEQ_LM,
-    target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+    target_modules=["query", "key", "value", "dense"],   # Albert-style names
 )
-model = get_peft_model(model, lora_cfg)
-model.print_trainable_parameters()
+try:
+    model = get_peft_model(model, lora_cfg)
+    model.print_trainable_parameters()
+except Exception as e:
+    # fallback: try MBart-style names
+    print(f"  LoRA with Albert names failed ({e}), trying q_proj/k_proj …", flush=True)
+    lora_cfg2 = LoraConfig(
+        r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=0.05,
+        bias="none", task_type=TaskType.SEQ_2_SEQ_LM,
+        target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+    )
+    model = get_peft_model(model, lora_cfg2)
+    model.print_trainable_parameters()
+
 model.to("cuda")
-print(f"[4/5] Model on GPU.\n", flush=True)
+print("[4/5] Model on GPU.\n", flush=True)
 
 # ── 6. tokenize ───────────────────────────────────────────────────────────────
+# Official IndicBARTSS format:
+#   src input_ids : <s> Q_tokens </s> <2te>   (no auto special tokens)
+#   tgt labels    : <2te> P_tokens </s>        (decoder sees <2te> as start)
 print("[5/5] Tokenizing …", flush=True)
 
-def encode(q: str, p: str):
-    src = tok(
-        q, max_length=MAX_SRC, truncation=True,
-        padding="max_length", return_tensors="pt",
-    )
-    tgt = tok(
-        text_target=p, max_length=MAX_TGT, truncation=True,
-        padding="max_length", return_tensors="pt",
-    )
-    labels = tgt["input_ids"].clone()
-    labels[labels == tok.pad_token_id] = -100
-    return {
-        "input_ids":      src["input_ids"].squeeze(0),
-        "attention_mask": src["attention_mask"].squeeze(0),
-        "labels":         labels.squeeze(0),
-    }
+def encode(q: str, p: str) -> dict | None:
+    src_text = f"{q} </s> {LANG_TOKEN}"
+    tgt_text = f"{LANG_TOKEN} {p} </s>"
+    src_ids = tok(src_text, add_special_tokens=False,
+                  max_length=MAX_LEN, truncation=True)["input_ids"]
+    tgt_ids = tok(tgt_text, add_special_tokens=False,
+                  max_length=MAX_LEN, truncation=True)["input_ids"]
+    if not src_ids or not tgt_ids:
+        return None
+    labels = list(tgt_ids)
+    # mask the leading lang token from loss (it's the decoder start, not a target)
+    labels[0] = -100
+    return {"src": src_ids, "tgt": tgt_ids[:-1], "labels": labels[1:]}
+    # decoder_input_ids = tgt[:-1], labels = tgt[1:]  (standard teacher forcing)
 
-# set language tokens if supported
-if hasattr(tok, "src_lang"):
-    tok.src_lang = "<2te>"
-if hasattr(tok, "tgt_lang"):
-    tok.tgt_lang = "<2te>"
+def encode_v2(q: str, p: str) -> dict | None:
+    """Standard seq2seq: decoder_input_ids=labels shifted right."""
+    src_text = f"{q} </s> {LANG_TOKEN}"
+    tgt_text = f"{LANG_TOKEN} {p} </s>"
+    src_ids = tok(src_text, add_special_tokens=False,
+                  max_length=MAX_LEN, truncation=True)["input_ids"]
+    tgt_ids = tok(tgt_text, add_special_tokens=False,
+                  max_length=MAX_LEN, truncation=True)["input_ids"]
+    if len(src_ids) < 2 or len(tgt_ids) < 2:
+        return None
+    labels = tgt_ids[:]
+    # pad positions in labels will be masked during collation
+    return {"src": src_ids, "tgt": tgt_ids}
 
 examples = []
 for q, p in tqdm(pairs, desc="Tokenizing", unit="pair"):
-    try:
-        examples.append(encode(q, p))
-    except Exception:
-        pass
+    e = encode_v2(q, p)
+    if e:
+        examples.append(e)
 
 print(f"[5/5] {len(examples):,} examples ready.\n", flush=True)
 
@@ -202,56 +225,70 @@ def lr_lambda(s: int) -> float:
 
 scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
+def collate(batch: list[dict]) -> dict:
+    max_src = max(len(e["src"]) for e in batch)
+    max_tgt = max(len(e["tgt"]) for e in batch)
+    src_ids  = torch.full((len(batch), max_src), pad_id, dtype=torch.long)
+    src_mask = torch.zeros((len(batch), max_src), dtype=torch.long)
+    tgt_ids  = torch.full((len(batch), max_tgt), pad_id, dtype=torch.long)
+    labels   = torch.full((len(batch), max_tgt), -100,   dtype=torch.long)
+    for i, e in enumerate(batch):
+        s, t = len(e["src"]), len(e["tgt"])
+        src_ids[i, :s]  = torch.tensor(e["src"])
+        src_mask[i, :s] = 1
+        tgt_ids[i, :t]  = torch.tensor(e["tgt"])
+        # labels = tgt shifted: decoder input is tgt[:-1], label is tgt[1:]
+        # here we pass full tgt as decoder_input_ids; HF model handles shift
+        lbl = e["tgt"][:]
+        # mask padding in labels
+        for j in range(t):
+            if lbl[j] != pad_id:
+                labels[i, j] = lbl[j]
+    return {"src_ids": src_ids, "src_mask": src_mask,
+            "tgt_ids": tgt_ids, "labels": labels}
+
 started   = time.perf_counter()
 step      = 0
 last_loss = 0.0
 
-print(f"Training: {EPOCHS} epoch(s) × {steps_per_epoch} steps = {total_steps} total", flush=True)
+print(f"Training: {EPOCHS} epoch × {steps_per_epoch} steps = {total_steps} total\n", flush=True)
 
 for epoch in range(EPOCHS):
     random.shuffle(examples)
     model.train()
-
-    pbar = tqdm(
-        range(0, len(examples), BATCH),
-        total=steps_per_epoch,
-        desc=f"Epoch {epoch+1}/{EPOCHS}",
-        unit="step",
-    )
-
+    pbar = tqdm(range(0, len(examples), BATCH),
+                total=steps_per_epoch,
+                desc=f"Epoch {epoch+1}/{EPOCHS}",
+                unit="step")
     for batch_start in pbar:
         chunk = examples[batch_start: batch_start + BATCH]
-
-        input_ids = torch.stack([e["input_ids"]      for e in chunk]).to("cuda")
-        attn_mask = torch.stack([e["attention_mask"] for e in chunk]).to("cuda")
-        labels    = torch.stack([e["labels"]         for e in chunk]).to("cuda")
-
-        out = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
+        b = collate(chunk)
+        out = model(
+            input_ids=b["src_ids"].to("cuda"),
+            attention_mask=b["src_mask"].to("cuda"),
+            decoder_input_ids=b["tgt_ids"].to("cuda"),
+            labels=b["labels"].to("cuda"),
+        )
         out.loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step(); scheduler.step(); opt.zero_grad(set_to_none=True)
         step += 1
         last_loss = float(out.loss.item())
-
         peak = torch.cuda.max_memory_allocated() / 1e9
         pbar.set_postfix(loss=f"{last_loss:.4f}", peak_gb=f"{peak:.1f}")
 
 elapsed = time.perf_counter() - started
-print(f"\nTraining done: {step} steps  {elapsed/60:.1f} min  final loss={last_loss:.4f}", flush=True)
+print(f"\nTraining done: {step} steps  {elapsed/60:.1f} min  final loss={last_loss:.4f}\n", flush=True)
 
 # ── 8. save ───────────────────────────────────────────────────────────────────
 ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
 model.save_pretrained(str(ADAPTER_DIR))
 tok.save_pretrained(str(ADAPTER_DIR))
-metrics = {
-    "model": MODEL_ID,
-    "steps": step, "examples": len(examples),
-    "seconds": round(elapsed, 1), "final_loss": last_loss,
-}
 (ADAPTER_DIR.parent / "sft_lora_metrics.json").write_text(
-    json.dumps(metrics, indent=2), encoding="utf-8")
-print(f"Adapter  : {ADAPTER_DIR}", flush=True)
-print(f"Metrics  : {ADAPTER_DIR.parent / 'sft_lora_metrics.json'}", flush=True)
+    json.dumps({"model": MODEL_ID, "steps": step, "examples": len(examples),
+                "seconds": round(elapsed, 1), "final_loss": last_loss}, indent=2),
+    encoding="utf-8")
+print(f"Adapter : {ADAPTER_DIR}", flush=True)
 
 # ── 9. demo ───────────────────────────────────────────────────────────────────
 print("\n── Demo ──────────────────────────────────────────────────────────────")
@@ -264,21 +301,28 @@ TEST_QUESTIONS = [
 ]
 
 for q in TEST_QUESTIONS:
-    enc = tok(q, return_tensors="pt", max_length=MAX_SRC, truncation=True)
-    enc = {k: v.to("cuda") for k, v in enc.items() if k in ("input_ids", "attention_mask")}
-    gen_kwargs = dict(
-        **enc,
-        max_new_tokens=MAX_TGT,
-        num_beams=4,
-        num_return_sequences=3,
-        early_stopping=True,
-    )
-    if FORCED_BOS_ID is not None:
-        gen_kwargs["forced_bos_token_id"] = FORCED_BOS_ID
+    src_text = f"{q} </s> {LANG_TOKEN}"
+    inp = tok(src_text, add_special_tokens=False,
+              return_tensors="pt", max_length=MAX_LEN, truncation=True)
+    inp = {k: v.to("cuda") for k, v in inp.items() if k in ("input_ids", "attention_mask")}
     with torch.no_grad():
-        out_ids = model.generate(**gen_kwargs)
+        out_ids = model.generate(
+            **inp,
+            use_cache=True,
+            num_beams=4,
+            num_return_sequences=3,
+            max_length=MAX_LEN,
+            min_length=5,
+            early_stopping=True,
+            pad_token_id=pad_id,
+            bos_token_id=bos_id,
+            eos_token_id=eos_id,
+            decoder_start_token_id=lang_id,   # <2te> starts the decoder
+        )
     print(f"\nQ: {q}")
     for i, seq in enumerate(out_ids, 1):
-        print(f"  {i}. {tok.decode(seq, skip_special_tokens=True).strip()}")
+        decoded = tok.decode(seq, skip_special_tokens=True,
+                             clean_up_tokenization_spaces=False).strip()
+        print(f"  {i}. {decoded}")
 
 print("\nDone.")
