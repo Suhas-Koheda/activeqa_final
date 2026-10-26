@@ -89,6 +89,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--out", default=str(ADAPTER_DIR))
     ap.add_argument("--epochs", type=float, default=1.0)
     ap.add_argument("--batch-size", type=int, default=48)
+    ap.add_argument("--max-pairs-per-question", type=int, default=4,
+                    help="targets kept per question for training (the "
+                         "held-out eval always uses 2, so its token-F1 stays "
+                         "comparable across runs)")
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--warmup", type=float, default=0.03)
     ap.add_argument("--max-src", type=int, default=96)
@@ -172,7 +176,8 @@ def split_questions(records: list[dict], eval_questions: int, seed: int):
 # ── tokenization (cached) ────────────────────────────────────────────────────
 def cache_key(args: argparse.Namespace) -> str:
     stat = Path(args.data).stat()
-    raw = f"{args.data}|{stat.st_size}|{int(stat.st_mtime)}|{args.max_src}|{args.max_tgt}"
+    raw = (f"{args.data}|{stat.st_size}|{int(stat.st_mtime)}|{args.max_src}|"
+           f"{args.max_tgt}|{args.max_pairs_per_question}")
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
@@ -508,10 +513,14 @@ def main() -> None:
 
     # ── data ─────────────────────────────────────────────────────────────────
     log(f"[3/7] Data {args.data}")
-    records = load_pairs(Path(args.data))
+    records = load_pairs(Path(args.data), args.max_pairs_per_question)
     if args.smoke:
         records = records[: int(os.environ["SMOKE_PAIRS"])]
     train_records, eval_records = split_questions(records, args.eval_questions, args.seed)
+    # Held-out eval keeps 2 references regardless (comparability across runs),
+    # while training can use the full per-question target list from the dataset.
+    for rec in eval_records:
+        rec["refs"] = rec["refs"][:2]
     log(f"      {len(records):,} questions -> {len(train_records):,} train / "
         f"{len(eval_records)} held out")
 
