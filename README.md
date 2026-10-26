@@ -38,6 +38,26 @@ excludes zero **and** the chosen rule beats the original question with a
 paired CI above zero. Otherwise `verdict.recommended_action` is `original`:
 reformulation is not worth deploying for that policy.
 
+### RL can run standalone and can never ship a worse policy
+
+Two safeguards (added after run 3, where RFT degraded a strong SFT start):
+
+* **`--from-base`** trains RL directly on the raw checkpoint with a fresh
+  LoRA (r=16, α=32 by default) — no SFT stage needed:
+  `python scripts/kaggle_run_all.py --from-base`.
+* **Checkpoint selection** saves a probe adapter every
+  `--checkpoint-every` optimizer updates (default 12) and measures it with
+  the real QA pipeline on a dev subset (`--checkpoint-eval-questions`, default
+  80; the trained end-state is probed too). The best probe — **including the
+  starting policy itself** — is reloaded and shipped, and `rl_metrics.json`
+  records the full checkpoint history plus `reverted_to_start`. RL
+  training therefore can never leave the run worse than it began; a late
+  drift can only throw its own update away.
+* **Headroom skip**: RFT skips questions the original already answers at
+  token-F1 ≥ 0.99 — training on solved questions reinforces safe
+  paraphrasing, which is how prior runs made selected QA worse while
+  "improving" reward.
+
 ### Measured result (held-out `dev.jsonl`, 200 questions)
 
 Two runs are on record: the previous one trained on the older multi-source

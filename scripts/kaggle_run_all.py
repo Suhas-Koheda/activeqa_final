@@ -12,6 +12,9 @@ Stages (each in its own process, so the SFT run's memory is released before RL):
                                 SFT and RL policies on held-out QA, and decide
                                 whether the RL adapter is an improvement.
 
+RL without the SFT stage (raw checkpoint + fresh LoRA):
+    python scripts/kaggle_run_all.py --from-base
+
 Rerun only one stage:
     python scripts/kaggle_run_all.py --from rl
     python scripts/kaggle_run_all.py --from sft
@@ -93,7 +96,15 @@ def main() -> int:
     parser.add_argument("--eval-only", action="store_true",
                         help="run only the SFT-adapter selector diagnostic from "
                              "the RL stage (no training); implies --from rl")
+    parser.add_argument("--from-base", action="store_true",
+                        help="skip SFT; train RL directly on the raw checkpoint "
+                             "with a fresh LoRA (no SFT adapter needed); implies "
+                             "--from rl and forwards --from-base to the RL stage")
     args = parser.parse_args()
+    if args.from_base:
+        if args.stage == "sft":
+            parser.error("--from-base skips SFT; use --from all or --from rl")
+        args.stage = "rl"
     if args.eval_only:
         if args.stage == "sft":
             parser.error("--eval-only applies to the RL stage; use --from rl")
@@ -124,13 +135,18 @@ def main() -> int:
                       f"4.57.6; see {SFT_DIR / 'run.log'}.")
                 return 3
     if args.stage in ("all", "rl"):
-        if not adapter_ready(SFT_DIR):
+        if not args.from_base and not adapter_ready(SFT_DIR):
             print(f"\nNo SFT adapter at {SFT_DIR / 'adapter'}. "
-                  "Run without --from rl (or with --from all) first.")
+                  "Run without --from rl (or with --from all) first, or use "
+                  "--from-base to train RL straight from the raw checkpoint.")
             return 2
+        extra_options: tuple[str, ...] = ()
+        if args.eval_only:
+            extra_options = (*extra_options, "--eval-only")
+        if args.from_base:
+            extra_options = (*extra_options, "--from-base")
         code = run_stage("STAGE 2 — RL", ROOT / "scripts" / "kaggle_run_rl.py",
-                         stage_args(args.rl_args,
-                                    ("--eval-only",) if args.eval_only else ()))
+                         stage_args(args.rl_args, extra_options))
         if code != 0:
             print("\nRL failed. The SFT adapter is still valid; see "
                   f"{RL_DIR / 'run.log'} for the traceback.")

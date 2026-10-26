@@ -1,24 +1,38 @@
 #!/usr/bin/env python3
-"""Telugu reformulator RL stage: SFT adapter → QA-reward RFT → paired held-out QA.
+"""Telugu reformulator RL stage: starting policy → QA-reward RFT → paired held-out QA.
 
 This is stage 2 of the one-command pipeline (stage 1 is scripts/colab_run_sft.py).
-It loads the SFT LoRA adapter, uses the frozen Telugu QA model as the reward,
-runs on-policy rejection-sampling fine-tuning, then evaluates the SFT and RL
-policies on the same held-out questions:
+It uses the frozen Telugu QA model as the reward, runs on-policy
+rejection-sampling fine-tuning, then evaluates the starting and RL policies on
+the same held-out questions:
 
-    python scripts/kaggle_run_rl.py
+    python scripts/kaggle_run_rl.py                 # RL on top of the SFT adapter
+    python scripts/kaggle_run_rl.py --from-base     # RL from the raw checkpoint
+                                                    # (fresh LoRA, no SFT needed)
+
+The starting policy is the SFT LoRA adapter when available, or the raw
+checkpoint with a fresh LoRA when ``--from-base`` is passed.
+
+Checkpoint selection guarantees the run can never ship a policy worse than the
+one it started with, no matter how noisy RL training is: every
+``--checkpoint-every`` optimizer updates (default 12) the current adapter is
+saved to <out>/probe/ and measured with ``evaluate_qa_pairs`` on a dev subset
+(``--checkpoint-eval-questions``, default 80). The trained end-state is probed
+too. The probe with the best subset ``selected_f1`` — including the starting
+policy itself — is reloaded and shipped.
 
 The number that matters is `selected_f1` in <out>/qa_eval.json: the answer
 token-F1 of the deployed confidence-selected reformulation, measured against
 the original question on the same passage.
 
 Everything is written to the run directory (models/indicbartss-reformulator-lora-rl):
-  adapter/            RL LoRA adapter (only overwritten after a real update)
+  adapter/            RL LoRA adapter (shipped policy; the starting policy when
+                      no checkpoint beat it)
   run.log             full transcript
   run_status.json     last completed stage (survives a crash)
-  rl_metrics.json     reward/selection/validity statistics and settings
+  rl_metrics.json     reward/selection/validity statistics, checkpoint history
   rl_samples.json     per-question training selections (raw, unfiltered)
-  qa_eval.json        SFT vs RL held-out QA summary + accept/reject verdict
+  qa_eval.json        start vs RL held-out QA summary + accept/reject verdict
   qa_eval_samples.json per-question predictions for both policies
 """
 from __future__ import annotations
@@ -75,12 +89,25 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sft-adapter", default=str(SFT_ADAPTER),
-                    help="LoRA adapter produced by scripts/colab_run_sft.py")
+                    help="LoRA adapter produced by scripts/colab_run_sft.py; "
+                         "ignored with --from-base")
+    ap.add_argument("--from-base", action="store_true",
+                    help="train RL directly from the raw checkpoint with a "
+                         "fresh LoRA — no SFT stage required")
+    ap.add_argument("--rl-lora-rank", type=int, default=16,
+                    help="rank of the fresh LoRA when --from-base")
+    ap.add_argument("--rl-lora-alpha", type=int, default=32,
+                    help="alpha of the fresh LoRA when --from-base")
+    ap.add_argument("--checkpoint-eval-questions", type=int, default=80,
+                    help="dev questions evaluated at every RL checkpoint "
+                         "(checkpoint selection; 0 disables)")
+    ap.add_argument("--checkpoint-every", type=int, default=12,
+                    help="run a checkpoint eval every N optimizer updates")
     ap.add_argument("--out", default=str(RL_DIR),
                     help="run directory; the RL adapter is written to <out>/adapter")
     ap.add_argument("--train", default="data/indic_rag_te/train.jsonl")
     ap.add_argument("--dev", default="data/indic_rag_te/dev.jsonl")
-    ap.add_argument("--questions", type=int, default=320,
+    ap.add_argument("--questions", type=int, default=640,
                     help="training questions per epoch (0 = all)")
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--candidates", type=int, default=6)
@@ -206,13 +233,19 @@ def main() -> None:
         args.generate_batch = 1
         args.eval_questions = 2
         args.eval_candidates = 2
+        args.checkpoint_eval_questions = 2
+        args.checkpoint_every = 1
         args.max_new = 16
 
     sft_adapter = Path(args.sft_adapter)
-    if not adapter_ready(sft_adapter):
+    if args.eval_only and args.from_base:
+        raise SystemExit("--eval-only evaluates the SFT adapter; it is "
+                         "incompatible with --from-base")
+    if not args.from_base and not adapter_ready(sft_adapter):
         raise SystemExit(
             f"SFT adapter not found at {sft_adapter}. Run scripts/colab_run_sft.py "
-            "first (or scripts/kaggle_run_all.py for both stages).")
+            "first, use scripts/kaggle_run_all.py for both stages, or pass "
+            "--from-base to train RL without the SFT adapter.")
 
     import torch
     if not args.skip_install:
@@ -244,17 +277,24 @@ def main() -> None:
     from activeqa.reformulator import Reformulator
     from activeqa.rft import rft_on_policy
 
-    # ── policy (SFT adapter, trainable) ─────────────────────────────────────
+    # ── policy (SFT adapter if present, otherwise the raw checkpoint + LoRA) ─
     model_path = resolve_model_path()
     log(f"[2/6] Reformulator {model_path}")
-    log(f"      loading SFT adapter {sft_adapter}")
     started = time.perf_counter()
-    ref = Reformulator(model_path, cache_dir="models", device=device,
-                       adapter_path=str(sft_adapter))
+    if args.from_base:
+        log(f"      --from-base: no SFT adapter; fresh LoRA "
+            f"(r={args.rl_lora_rank}, alpha={args.rl_lora_alpha})")
+        ref = Reformulator(model_path, cache_dir="models", device=device,
+                           rank=args.rl_lora_rank, alpha=args.rl_lora_alpha)
+    else:
+        log(f"      loading SFT adapter {sft_adapter}")
+        ref = Reformulator(model_path, cache_dir="models", device=device,
+                           adapter_path=str(sft_adapter))
     log(f"      trainable params: {ref.trainable_count:,}  "
         f"({time.perf_counter() - started:.1f}s)")
     record_status(status_path, "policy_loaded",
-                  adapter=str(sft_adapter), trainable=ref.trainable_count)
+                  adapter=str(sft_adapter) if not args.from_base else None,
+                  from_base=args.from_base, trainable=ref.trainable_count)
 
     qa_started = time.perf_counter()
     log(f"[3/6] Frozen QA reward model {QA_MODEL}")
@@ -265,17 +305,20 @@ def main() -> None:
         sft_eval = rl_eval = None
         sft_records = rl_records = []
     else:
+        start_name = "base" if args.from_base else "sft"
         dev_rows = load_rows(args.dev, args.eval_questions, args.seed)
-        log(f"[4/6] Held-out QA eval — SFT policy, {len(dev_rows)} questions")
+        log(f"[4/6] Held-out QA eval — starting policy "
+            f"({'raw checkpoint' if args.from_base else 'SFT adapter'}), "
+            f"{len(dev_rows)} questions")
         torch.manual_seed(args.seed)
         sft_eval, sft_records = evaluate_qa_pairs(
             ref, qa, dev_rows, candidates=args.eval_candidates,
             limit=args.eval_questions, max_input=args.max_input,
             max_new=args.max_new, confidence_override=args.conf_override,
-            log=log, label="sft")
+            log=log, label=start_name)
         record_status(status_path, "pre_eval_done",
                       selected_f1=sft_eval["selected_f1"])
-        log(f"      SFT selected_f1={sft_eval['selected_f1']:.4f} "
+        log(f"      {start_name} selected_f1={sft_eval['selected_f1']:.4f} "
             f"(original {sft_eval['original_f1']:.4f}, "
             f"generation oracle {sft_eval['generation_oracle_f1']:.4f})")
         if args.eval_only:
@@ -356,8 +399,63 @@ def main() -> None:
             return
 
     # ── RL ───────────────────────────────────────────────────────────────────
+    # Checkpoint selection: a probe adapter is saved and measured on a dev
+    # subset after every N optimizer updates. Only checkpoints that beat the
+    # starting policy's subset selected_f1 may survive; otherwise the starting
+    # policy is reused for the final held-out eval. RL can therefore never
+    # make the shipped policy worse than what it started from.
+    import shutil
+
+    cp_rows = []
+    starting_subset_f1 = None
+    checkpoint_history: list[dict] = []
+    best_checkpoint: dict = {"updates": 0, "subset_selected_f1": None,
+                             "path": None}
+    if not args.no_eval and args.checkpoint_eval_questions > 0:
+        cp_rows = load_rows(args.dev, args.checkpoint_eval_questions, args.seed)
+    if cp_rows:
+        log(f"      checkpoint selection on {len(cp_rows)} dev questions, "
+            f"every {args.checkpoint_every} updates")
+        torch.manual_seed(args.seed)
+        ref.model.eval()
+        subset_base, _ = evaluate_qa_pairs(
+            ref, qa, cp_rows, candidates=args.eval_candidates,
+            limit=len(cp_rows), max_input=args.max_input,
+            max_new=args.max_new, confidence_override=args.conf_override,
+            log=log, label="checkpoint-baseline")
+        ref.model.train()
+        starting_subset_f1 = subset_base["selected_f1"]
+        best_checkpoint["subset_selected_f1"] = starting_subset_f1
+        checkpoint_history.append(
+            {"updates": 0, "state": "starting policy",
+             "selected_f1": starting_subset_f1})
+        log(f"      starting policy subset selected_f1: {starting_subset_f1:.4f}")
+
+    def checkpoint_hook(n_updates: int) -> None:
+        if not cp_rows or n_updates % max(1, args.checkpoint_every):
+            return
+        probe = out_dir / "probe" / f"ckpt_{n_updates:04d}"
+        ref.save_adapter(str(probe))
+        ref.model.eval()
+        torch.manual_seed(args.seed)
+        summary, _ = evaluate_qa_pairs(
+            ref, qa, cp_rows, candidates=args.eval_candidates,
+            limit=len(cp_rows), max_input=args.max_input,
+            max_new=args.max_new, confidence_override=args.conf_override,
+            log=log, label=f"checkpoint@{n_updates}")
+        ref.model.train()
+        f1 = summary["selected_f1"]
+        checkpoint_history.append({"updates": n_updates, "state": str(probe),
+                                   "selected_f1": f1})
+        if f1 > best_checkpoint["subset_selected_f1"]:
+            best_checkpoint.update(updates=n_updates, subset_selected_f1=f1,
+                                   path=str(probe))
+            log(f"      checkpoint {n_updates} is the new best subset "
+                f"selected_f1: {f1:.4f}")
+
     train_rows = load_rows(args.train, args.questions, args.seed)
-    log(f"[5/6] RL (RFT) on {len(train_rows)} questions × {args.epochs} epoch(s)")
+    log(f"[5/6] RL (RFT) on {len(train_rows)} questions × {args.epochs} epoch(s)"
+        + ("  [--from-base]" if args.from_base else ""))
     metrics, train_records = rft_on_policy(
         ref, qa, train_rows,
         candidates=args.candidates,
@@ -370,30 +468,105 @@ def main() -> None:
         max_new=args.max_new,
         generate_batch=args.generate_batch,
         seed=args.seed,
+        after_update=checkpoint_hook if cp_rows else None,
+        skip_solved=True,
         log=log)
     record_status(status_path, "train_done",
                   optimizer_steps=metrics["optimizer_steps"],
                   selected_rate=metrics["selected_rate"])
 
     if metrics["optimizer_steps"] == 0:
-        log("      WARNING: no qualifying rewrite was found; the SFT adapter was "
-            "not changed. Lower --margin / --conf-slack or raise --candidates.")
+        log("      WARNING: no qualifying rewrite was found; the starting policy "
+            "was not changed. Lower --margin / --conf-slack or raise --candidates.")
         record_status(status_path, "no_updates")
         (out_dir / "rl_metrics.json").write_text(
-            json.dumps({"training": metrics, "sft_adapter": str(sft_adapter)},
+            json.dumps({"training": metrics,
+                        "sft_adapter": str(sft_adapter),
+                        "from_base": args.from_base},
                        indent=2, ensure_ascii=False), encoding="utf-8")
-        print("\nRL produced no updates — keeping the SFT adapter unchanged.")
+        print("\nRL produced no updates — keeping the starting policy unchanged.")
         return
 
     adapter_dir = out_dir / "adapter"
-    ref.save_adapter(str(adapter_dir))
-    log(f"[6/6] RL adapter saved: {adapter_dir}")
+    used_checkpoint_selection = bool(cp_rows and not args.no_eval)
+    reverted = False
+    if used_checkpoint_selection:
+        # Measure the trained end-state too (its last partial window of
+        # updates was not covered by a periodic probe).
+        final_probe = out_dir / "probe" / "ckpt_final"
+        ref.save_adapter(str(final_probe))
+        ref.model.eval()
+        torch.manual_seed(args.seed)
+        summary, _ = evaluate_qa_pairs(
+            ref, qa, cp_rows, candidates=args.eval_candidates,
+            limit=len(cp_rows), max_input=args.max_input,
+            max_new=args.max_new, confidence_override=args.conf_override,
+            log=log, label="checkpoint@final")
+        f1 = summary["selected_f1"]
+        checkpoint_history.append({
+            "updates": metrics["optimizer_steps"], "state": str(final_probe),
+            "selected_f1": f1})
+        if f1 > best_checkpoint["subset_selected_f1"]:
+            best_checkpoint.update(updates=metrics["optimizer_steps"],
+                                   subset_selected_f1=f1,
+                                   path=str(final_probe))
+        if best_checkpoint["path"] is None:
+            # No RL checkpoint beat the starting policy on the subset:
+            # the shipped RL policy is the starting policy itself.
+            reverted = True
+            log(f"      RL never beat the starting policy on the checkpoint "
+                f"subset ({starting_subset_f1:.4f}); shipping the starting "
+                "policy unchanged")
+        # Reload the chosen weights so the final held-out eval measures the
+        # policy that will actually be shipped, not the drifted end-state.
+        ref_device = str(ref.device)
+        del ref
+        torch.cuda.empty_cache()
+        if reverted:
+            if args.from_base:
+                ref = Reformulator(model_path, cache_dir="models",
+                                   device=ref_device,
+                                   rank=args.rl_lora_rank,
+                                   alpha=args.rl_lora_alpha)
+            else:
+                ref = Reformulator(model_path, cache_dir="models",
+                                   device=ref_device,
+                                   adapter_path=str(sft_adapter))
+            ref.model.eval()
+        else:
+            ref = Reformulator(model_path, cache_dir="models",
+                               device=ref_device,
+                               adapter_path=str(best_checkpoint["path"]))
+            ref.model.eval()
+            log(f"      shipping checkpoint at {best_checkpoint['updates']} "
+                f"updates (subset selected_f1 "
+                f"{best_checkpoint['subset_selected_f1']:.4f})")
+        # Clean the probe adapters only after the chosen weights are reloaded
+        # elsewhere, so the files are no longer needed.
+        shutil.rmtree(out_dir / "probe", ignore_errors=True)
+    if args.from_base and reverted:
+        rl_adapter_path = None      # the starting (adapter-free) policy ships
+    else:
+        ref.save_adapter(str(adapter_dir))
+        rl_adapter_path = str(adapter_dir)
+        log(f"[6/6] RL adapter saved: {adapter_dir}")
     record_status(status_path, "adapter_saved",
-                  optimizer_steps=metrics["optimizer_steps"])
+                  optimizer_steps=metrics["optimizer_steps"],
+                  reverted_to_start=reverted)
     (out_dir / "rl_metrics.json").write_text(json.dumps({
         "training": metrics,
         "sft_adapter": str(sft_adapter),
-        "rl_adapter": str(adapter_dir),
+        "from_base": args.from_base,
+        "rl_adapter": rl_adapter_path,
+        "checkpoint_selection": {
+            "enabled": used_checkpoint_selection,
+            "subset_questions": len(cp_rows),
+            "checkpoint_every": args.checkpoint_every,
+            "starting_subset_selected_f1": starting_subset_f1,
+            "best": best_checkpoint,
+            "history": checkpoint_history,
+            "reverted_to_start": reverted,
+        },
     }, indent=2, ensure_ascii=False), encoding="utf-8")
     (out_dir / "rl_samples.json").write_text(
         json.dumps(train_records, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -441,7 +614,7 @@ def main() -> None:
     significant = bool(selected_ci[0] > 0 or corrective_ci[0] > 0
                        or consensus_ci[0] > 0)
 
-    best_policy = "rl" if accepted else "sft"
+    best_policy = "rl" if accepted else start_name
     best_eval = rl_eval if accepted else sft_eval
     selector_scores = {
         "consistent": best_eval["selected_f1"],
@@ -458,7 +631,8 @@ def main() -> None:
     if accepted:
         reason = "RL improved the held-out QA objective"
     elif rule:
-        reason = "RL did not beat SFT; keep the better SFT selector"
+        reason = ("RL did not beat the starting policy; keep the better "
+                  f"{start_name} selector")
     else:
         reason = ("No reformulation policy beat the original question on "
                   "held-out QA with a CI above zero")
@@ -481,6 +655,7 @@ def main() -> None:
                         "corrective_f1": corrective_ci,
                         "consensus_f1": consensus_ci},
         "reason": reason,
+        "from_base": args.from_base,
         "sft_adapter": str(sft_adapter),
         "rl_adapter": str(adapter_dir),
     }
@@ -522,7 +697,7 @@ def main() -> None:
               "rerun with more --questions / --epochs before claiming a gain.")
     if not accepted:
         print("  The RL adapter is kept for inspection; downstream runs should keep "
-              "using the SFT adapter unless you decide otherwise.")
+              "using the starting policy unless you decide otherwise.")
 
     print("\n── Raw RL examples (no decode-time filtering beyond the policy's "
           "own validity gate) ──")

@@ -28,7 +28,7 @@ import torch
 
 from .preprocessing import entity_signature
 from .policy_gradient import sft_batch_step
-from .rewards import reward
+from .rewards import reward, token_f1
 
 
 def _chunks(items, size):
@@ -40,12 +40,16 @@ def rft_on_policy(ref, qa, rows, *, candidates=6, batch_questions=8,
                   epochs=1, learning_rate=7e-5, margin=0.0,
                   confidence_slack=0.0, max_input=96, max_new=64,
                   do_sample=True, seed=42, generate_batch=8,
-                  max_updates=None, log=print):
+                  max_updates=None, after_update=None, skip_solved=True,
+                  log=print):
     """Run RFT on ``rows`` (dicts with question/context/answers).
 
-    Returns a metrics dict and a bounded list of per-question records. The
-    caller is responsible for saving the adapter; this function only mutates
-    the trainable parameters of ``ref.model``.
+    ``skip_solved``: questions whose original answer is already correct
+    (token-F1 ≥ 0.99) are skipped — there is no headroom to learn from and
+    training on them only teaches safe paraphrasing of solved cases.
+    ``after_update(n)`` is called after every optimizer step that reaches
+    ``n`` updates; the pipeline uses it to snapshot + evaluate adapters so a
+    late drift can never destroy an earlier improvement (checkpoint selection).
     """
     if not rows:
         raise ValueError("RFT needs at least one training question")
@@ -58,7 +62,8 @@ def rft_on_policy(ref, qa, rows, *, candidates=6, batch_questions=8,
 
     log(f"      RFT: {len(rows)} questions × {epochs} epoch(s), "
         f"{candidates} candidates, {batch_questions} targets/update, "
-        f"lr={learning_rate}, margin={margin}, conf_slack={confidence_slack}")
+        f"lr={learning_rate}, margin={margin}, conf_slack={confidence_slack}, "
+        f"skip_solved={skip_solved}")
     log(f"      RFT trainable params: {sum(p.numel() for p in trainable):,}")
 
     pending = []          # [(question, token_ids)]
@@ -66,6 +71,7 @@ def rft_on_policy(ref, qa, rows, *, candidates=6, batch_questions=8,
     records = []
     scanned = scored = valid_actions = 0
     selected_questions = 0
+    solved_skipped = 0
     question_errors = 0
     update_skipped = 0
     original_reward_sum = 0.0
@@ -91,6 +97,9 @@ def rft_on_policy(ref, qa, rows, *, candidates=6, batch_questions=8,
             return None
         losses.append(loss)
         pending.clear()
+        if after_update is not None:
+            ref.model.train()
+            after_update(len(losses))
         return loss
 
     for epoch in range(epochs):
@@ -122,6 +131,11 @@ def rft_on_policy(ref, qa, rows, *, candidates=6, batch_questions=8,
                                          valid=True, preserve=1.0)
                 original_confidence = answers[0][2]
                 original_reward_sum += original_reward
+                if (skip_solved and margin >= 0.0
+                        and token_f1(answers[0][0], row["answers"]) >= 0.99):
+                    # The original already answers correctly: no headroom.
+                    solved_skipped += 1
+                    continue
 
                 values = []
                 confidences = []
@@ -196,6 +210,8 @@ def rft_on_policy(ref, qa, rows, *, candidates=6, batch_questions=8,
         "candidate_actions": scored,
         "optimizer_steps": len(losses),
         "skipped_updates": update_skipped,
+        "solved_skipped": solved_skipped,
+        "solved_skip_rate": round(solved_skipped / max(1, scanned), 4),
         "question_errors": question_errors,
         "valid_generation_rate": round(valid_actions / max(1, scored), 4),
         "selected_rate": round(selected_questions / max(1, scanned), 4),
@@ -219,6 +235,7 @@ def rft_on_policy(ref, qa, rows, *, candidates=6, batch_questions=8,
             "max_new_tokens": max_new,
             "do_sample": do_sample,
             "seed": seed,
+            "skip_solved_originals": skip_solved,
         },
     }
     log(f"      RFT done: {scanned} questions, {len(losses)} updates, "

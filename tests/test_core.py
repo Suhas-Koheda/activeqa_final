@@ -467,7 +467,7 @@ def test_rft_takes_an_update_only_for_qualifying_rewrites():
         ref, FakeQA(),
         [{"question": "q", "context": "c", "answers": ["gold"]}],
         candidates=2, batch_questions=1, epochs=1, learning_rate=1e-2,
-        generate_batch=1, log=lambda *_: None)
+        generate_batch=1, skip_solved=False, log=lambda *_: None)
     assert metrics["optimizer_steps"] == 1
     assert metrics["selected_rate"] == 1.0
     assert len(records) == 1
@@ -500,9 +500,48 @@ def test_rft_skips_when_no_rewrite_beats_the_original():
     metrics, records = rft_on_policy(
         FakeRef(), WorseQA(),
         [{"question": "q", "context": "c", "answers": ["gold"]}],
+        candidates=3, batch_questions=1, epochs=1, skip_solved=False,
+        log=lambda *_: None)
+    assert metrics["optimizer_steps"] == 0
+    assert metrics["selected_rate"] == 0.0
+    assert records == []
+
+
+def test_rft_skips_questions_the_original_already_solves():
+    """Headroom skip: an original that already scores token-F1 ≥ 0.99 has no
+    room to improve, so RFT must not train on it (it would only reinforce
+    safe paraphrasing of solved cases). The default is skip_solved=True."""
+    import torch
+    from activeqa.rft import rft_on_policy
+
+    class FakeRef:
+        def __init__(self):
+            self.model = torch.nn.Linear(1, 1)
+            self.calls = 0
+
+        def sample_actions_batch(self, questions, candidates, *args, **kwargs):
+            self.calls += 1
+            return [[{"valid": True, "sampled_text": "rewrite", "candidate": "rewrite",
+                      "token_ids": [1]} for _ in range(candidates)]
+                    for _ in questions]
+
+        def sequence_logprob_batch(self, pairs, max_input):
+            raise AssertionError("no update should be attempted when the "
+                                 "original already solves the question")
+
+    class SolvedQA:
+        def answer_batch(self, questions, context):
+            # Every answer, original and rewrites, is exactly the gold string.
+            return [("gold", 0.0, -0.5)] * len(questions)
+
+    metrics, records = rft_on_policy(
+        FakeRef(), SolvedQA(),
+        [{"question": "q", "context": "c", "answers": ["gold"]}],
         candidates=3, batch_questions=1, epochs=1, log=lambda *_: None)
     assert metrics["optimizer_steps"] == 0
     assert metrics["selected_rate"] == 0.0
+    assert metrics["solved_skipped"] == 1
+    assert metrics["solved_skip_rate"] == 1.0
     assert records == []
 
 

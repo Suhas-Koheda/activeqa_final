@@ -119,6 +119,15 @@ class Reformulator:
             self.model = PeftModel.from_pretrained(
                 self.model, adapter_path, is_trainable=True)
             self.model.print_trainable_parameters()
+        elif rank is not None:
+            # RL from the raw checkpoint: attach a fresh LoRA instead of
+            # fine-tuning all 246 M parameters full-parameter (T4-sized).
+            from peft import LoraConfig, TaskType, get_peft_model
+            self.model = get_peft_model(self.model, LoraConfig(
+                r=rank, lora_alpha=(alpha or 2 * rank),
+                lora_dropout=0.05, bias="none", task_type=TaskType.SEQ_2_SEQ_LM,
+                target_modules=["q_proj", "k_proj", "v_proj", "out_proj"]))
+            self.model.print_trainable_parameters()
         self.model.to(self.device)
         # A trained adapter expects the checkpoint's embeddings to stay tied. A
         # pre-release transformers build once produced random, untied tables
