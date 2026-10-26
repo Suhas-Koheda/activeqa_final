@@ -297,9 +297,28 @@ def main() -> None:
                       f"harmed={row['harmed_rate']:.3f}")
             print(f"  best margin on this dev set: {sft_eval['best_margin']} "
                   f"(diagnostic only; confirm on a second split)")
+            print(f"  ceiling (best of original+rewrites) "
+                  f"{sft_eval['ceiling_f1']:.4f} "
+                  f"({sft_eval['ceiling_delta_f1']:+.4f}); "
+                  f"recoverable {sft_eval['recoverable_rate']:.3f} "
+                  f"(gain {sft_eval['recoverable_mean_gain']:+.4f}, "
+                  f"orig conf {sft_eval['recoverable_original_confidence']:+.2f} "
+                  f"vs {sft_eval['nonrecoverable_original_confidence']:+.2f})")
+            print("  low-confidence gate sweep (best valid rewrite when the "
+                  "original answer is uncertain):")
+            for quantile, row in sft_eval["gate_sweep"].items():
+                print(f"    q{quantile} ≤{row['threshold']:+.3f}  "
+                      f"f1={row['selected_f1']:.4f}  "
+                      f"gated={row['examples']:3d}  "
+                      f"{row['gated_original_f1']:.4f}→"
+                      f"{row['gated_selected_f1']:.4f}  "
+                      f"switch={row['switch_rate']:.3f}")
             (out_dir / "qa_eval_sft_only.json").write_text(
                 json.dumps({"sft": sft_eval}, indent=2, ensure_ascii=False),
                 encoding="utf-8")
+            (out_dir / "qa_eval_samples_sft_only.json").write_text(
+                json.dumps({"sft": sft_records}, indent=2,
+                           ensure_ascii=False), encoding="utf-8")
             record_status(status_path, "eval_only_done",
                           selected_f1=sft_eval["selected_f1"],
                           consensus_f1=sft_eval["consensus_f1"])
@@ -447,6 +466,10 @@ def main() -> None:
     print("  SFT confidence-margin sweep: " + "  ".join(
         f"{margin}→{row['selected_f1']:.4f}"
         for margin, row in sft_eval["margin_sweep"].items()))
+    print(f"  SFT confidence-gate sweep: best q={sft_eval['best_gate']} "
+          f"→ {sft_eval['gate_sweep'][sft_eval['best_gate']]['selected_f1']:.4f} "
+          f"(original {sft_eval['original_f1']:.4f}); "
+          f"ceiling {sft_eval['ceiling_f1']:.4f}")
     print(f"  Original question F1: {rl_eval['original_f1']:.4f}   "
           f"best policy+selector: {best_selector_f1:.4f} "
           f"({best_policy}/{recommended_selector})")

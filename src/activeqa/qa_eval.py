@@ -55,6 +55,13 @@ def _bootstrap_ci(deltas, samples=1000):
             round(boots[int(0.975 * samples) - 1], 4)]
 
 
+def _quantile(values, q):
+    """Nearest-rank quantile without adding a numpy dependency."""
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round(q * (len(ordered) - 1)))))
+    return ordered[index]
+
+
 def paired_delta_ci(records_a, records_b, key, samples=1000):
     """Bootstrap CI for mean(a[key] - b[key]) over aligned per-question rows.
 
@@ -194,6 +201,14 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
         corrective_question = texts[corrective_index]
         corrective_f1 = token_f1(answers[corrective_index][0], row["answers"])
 
+        valid_actions = [i for i, cand in enumerate(candidate_f1s)
+                         if cand["valid"]]
+        best_rewrite = (max(valid_actions,
+                            key=lambda i: candidate_f1s[i]["confidence"])
+                        if valid_actions else None)
+        best_rewrite_f1 = (candidate_f1s[best_rewrite]["f1"]
+                           if best_rewrite is not None else original_f1)
+
         consensus = _consensus_choice(answers, candidate_f1s, original_answer,
                                       original_confidence)
         # _consensus_choice returns a 0-based candidate index; texts/answers
@@ -204,6 +219,8 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
 
         valid_f1s = [cand["f1"] for cand in candidate_f1s if cand["valid"]]
         oracle_f1 = max(valid_f1s) if valid_f1s else original_f1
+        # Upper bound for any selector over {original, rewrites}.
+        ceiling_f1 = max(original_f1, oracle_f1)
         scripts = _script_counts(selected_question)
         records.append({
             "id": row.get("id"),
@@ -224,6 +241,8 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
             "consensus_f1": consensus_f1,
             "consensus_question": consensus_question,
             "consensus_switch": consensus_index != 0,
+            "best_rewrite_index": best_rewrite,
+            "best_rewrite_f1": best_rewrite_f1,
             "candidate_f1s": [cand["f1"] for cand in candidate_f1s],
             "candidate_validity": [cand["valid"] for cand in candidate_f1s],
             "candidate_texts": [cand["text"] for cand in candidate_f1s],
@@ -232,6 +251,7 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
             "margin_f1": margin_f1,
             "margin_switch": margin_switch,
             "generation_oracle_f1": oracle_f1,
+            "ceiling_f1": ceiling_f1,
             "valid": True if best == 0 else candidate_f1s[best - 1]["valid"],
             "scripts": scripts,
         })
@@ -317,6 +337,63 @@ def evaluate_qa_pairs(ref, qa, rows, *, candidates=4, limit=None,
     summary["margin_sweep"] = margin_sweep
     summary["best_margin"] = max(
         margin_sweep, key=lambda key: margin_sweep[key]["selected_f1"])
+
+    # ── selective reformulation ─────────────────────────────────────────────
+    # Can a deployable rule (gate on the original's own span confidence) find
+    # the questions where a rewrite actually beats the original? This is the
+    # only route left when the policy's candidate oracle is below the original:
+    # abstain everywhere except the uncertain originals.
+    def _mean(values):
+        return sum(values) / len(values) if values else 0.0
+
+    recoverable = [record for record in records
+                   if record["ceiling_f1"] > record["original_f1"] + 1e-9]
+    not_recoverable = [record for record in records
+                       if record["ceiling_f1"] <= record["original_f1"] + 1e-9]
+    summary["ceiling_f1"] = round(
+        sum(record["ceiling_f1"] for record in records) / n, 4)
+    summary["ceiling_delta_f1"] = round(
+        summary["ceiling_f1"] - summary["original_f1"], 4)
+    summary["recoverable_rate"] = round(len(recoverable) / n, 4)
+    summary["recoverable_mean_gain"] = round(_mean(
+        [record["ceiling_f1"] - record["original_f1"]
+         for record in recoverable]), 4)
+    summary["recoverable_original_confidence"] = round(_mean(
+        [record["original_confidence"] for record in recoverable]), 4)
+    summary["nonrecoverable_original_confidence"] = round(_mean(
+        [record["original_confidence"] for record in not_recoverable]), 4)
+
+    confidences = [record["original_confidence"] for record in records]
+    gate_sweep = {}
+    for quantile in (0.0, 0.1, 0.25, 0.5, 0.75, 1.0):
+        threshold = _quantile(confidences, quantile)
+        gated = [record for record in records
+                 if record["original_confidence"] <= threshold]
+        # Inside the gate, use the most confident valid rewrite. The
+        # conservative rule cannot help here by construction: a wrong original
+        # requires changing the answer, which consistency forbids.
+        values = [(record["best_rewrite_f1"]
+                   if record["original_confidence"] <= threshold
+                   else record["original_f1"]) for record in records]
+        gate_sweep[f"{quantile:.2f}"] = {
+            "threshold": round(threshold, 4),
+            "examples": len(gated),
+            "selected_f1": round(sum(values) / n, 4),
+            "delta_f1": round(sum(values) / n - summary["original_f1"], 4),
+            "gated_original_f1": round(_mean(
+                [record["original_f1"] for record in gated]), 4),
+            "gated_selected_f1": round(_mean(
+                [record["best_rewrite_f1"] for record in gated]), 4),
+            "switch_rate": round(sum(
+                record["best_rewrite_index"] is not None
+                for record in gated) / n, 4),
+            "harmed_rate": round(sum(
+                value < record["original_f1"] - 1e-9
+                for value, record in zip(values, records)) / n, 4),
+        }
+    summary["gate_sweep"] = gate_sweep
+    summary["best_gate"] = max(
+        gate_sweep, key=lambda key: gate_sweep[key]["selected_f1"])
     summary["switched_mean_lift"] = round(
         sum(r["selected_f1"] - r["original_f1"] for r in switched)
         / max(1, len(switched)), 4)

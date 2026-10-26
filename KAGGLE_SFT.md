@@ -88,6 +88,16 @@ Reading the RL verdict:
 - **`margin_sweep`** — the consistent rule at confidence margins
   `+0.00, +0.10, +0.25, +0.50, +1.00` over the original. `best_margin` is a
   diagnostic on this dev set, not an automatically deployed setting.
+- **`ceiling_f1`** — the best achievable score if a perfect selector could
+  choose the original or the best rewrite per question. If
+  `ceiling_delta_f1 <= 0`, no selection rule can beat doing nothing.
+- **`recoverable_rate` / `recoverable_original_confidence`** — the share of
+  questions where a rewrite beats the original, and whether those originals are
+  less confident than the rest. That difference is the only signal a deployable
+  gate can use.
+- **`gate_sweep`** — reformulate only when the original's span confidence is
+  below a quantile, using the most confident valid rewrite inside the gate.
+  This targets uncertain originals instead of rewriting everything.
 - **paired 95% CI** — bootstrap over the per-question RL − SFT difference. A
   positive delta whose CI includes 0 needs a longer run before claiming a gain.
 - **`recommended_action`** — `original` when every policy+selector pair scores

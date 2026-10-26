@@ -574,3 +574,41 @@ def test_paired_ci_is_computed_on_rl_minus_sft_differences():
     sft = [{"selected_f1": 0.0}, {"selected_f1": 0.5}, {"selected_f1": 1.0}]
     rl = [{"selected_f1": 0.1}, {"selected_f1": 0.6}, {"selected_f1": 1.1}]
     assert paired_delta_ci(rl, sft, "selected_f1") == [0.1, 0.1]
+
+
+def test_qa_eval_reports_selective_reformulation_headroom():
+    """The ceiling and gate sweep must be measured, not guessed.
+
+    Q1 is wrong with low confidence and a rewrite recovers it; Q2 is already
+    correct with high confidence. A confidence gate should reformulate Q1 and
+    keep Q2, and the ceiling must equal the best achievable per question.
+    """
+    from activeqa.qa_eval import evaluate_qa_pairs
+
+    class FakeReformulator:
+        def sample_actions(self, question, candidates, *args, **kwargs):
+            text = "gold" if question == "low" else "renamed"
+            return [{"sampled_text": text, "candidate": text, "valid": True}]
+
+    class FakeQA:
+        def answer_batch(self, questions, context):
+            table = {"low": ("wrong", 0.0, -3.0),
+                     "gold": ("gold", 0.0, -1.0),
+                     "high": ("answer", 0.0, 5.0),
+                     "renamed": ("answer", 0.0, 6.0)}
+            return [table[question] for question in questions]
+
+    summary, records = evaluate_qa_pairs(
+        FakeReformulator(), FakeQA(),
+        [{"id": "low", "question": "low", "context": "c", "answers": ["gold"]},
+         {"id": "high", "question": "high", "context": "c", "answers": ["answer"]}],
+        candidates=1, limit=2, label="test")
+
+    assert summary["ceiling_f1"] == pytest.approx(1.0)
+    # Only Q1 can be recovered; Q2 is already at the ceiling.
+    assert summary["recoverable_rate"] == pytest.approx(0.5)
+    assert summary["recoverable_mean_gain"] == pytest.approx(1.0)
+    assert summary["gate_sweep"]["0.00"]["examples"] == 1
+    assert summary["gate_sweep"]["0.00"]["selected_f1"] == pytest.approx(1.0)
+    assert summary["gate_sweep"]["1.00"]["selected_f1"] == pytest.approx(1.0)
+    assert summary["best_gate"] in summary["gate_sweep"]
