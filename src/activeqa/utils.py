@@ -41,12 +41,30 @@ def make_policy_optimizer(params, lr):
                      relative_step=False, warmup_init=False)
 
 def load_policy_state(model, saved):
-    """Load current full-model policy checkpoints and legacy LoRA checkpoints."""
+    """Load current full-model policy checkpoints and legacy/peft LoRA checkpoints."""
     if "model_state" in saved:
+        if hasattr(model, "peft_config"):
+            raise ValueError(
+                "This is a full-model checkpoint, but the configured reformulator "
+                "uses a LoRA adapter. Set models.reformulator_adapter instead of "
+                "training.checkpoint, or run without the adapter.")
         model.load_state_dict(saved["model_state"])
         return
     if "adapter" in saved:
         from peft import set_peft_model_state_dict
         set_peft_model_state_dict(model, saved["adapter"])
         return
-    raise ValueError("Checkpoint has no model_state or legacy adapter weights")
+    raise ValueError("Checkpoint has no model_state or adapter weights")
+
+
+def policy_state(model):
+    """Return the minimal resumable state for a full-model or LoRA policy.
+
+    Saving ``PeftModel.state_dict()`` also serialises the frozen 246M base
+    weights (~1 GB per checkpoint), which is why adapter runs use
+    ``get_peft_model_state_dict`` instead.
+    """
+    if hasattr(model, "peft_config"):
+        from peft import get_peft_model_state_dict
+        return {"adapter": get_peft_model_state_dict(model)}
+    return {"model_state": model.state_dict()}

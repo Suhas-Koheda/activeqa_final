@@ -8,6 +8,7 @@ from activeqa.data import _load_indicqa_json
 from activeqa.qa_model import _context_token_mask
 from activeqa.selection import select_qa_score
 import json, tempfile, os
+import pytest
 
 def test_unicode_normalization_and_tokens():
     assert normalize('  తెలుగు\nప్రశ్న ')=='తెలుగు ప్రశ్న'
@@ -331,3 +332,175 @@ def test_retrieval_can_use_full_disjoint_train_partition(monkeypatch, tmp_path):
     assert len(heldout) == 2
     assert len(retrieval_corpus) == 8
     assert {row["id"] for row in heldout}.isdisjoint(row["id"] for row in retrieval_corpus)
+
+
+def test_reformulator_accepts_real_sft_paraphrases():
+    """The RL validity gate must not reject genuine SFT output.
+
+    These are raw candidates from the verified SFT run. The old gate required
+    55% of all content words to survive and only accepted known==known answer
+    types, which rejected 4 of these 5 paraphrases and silently reduced the RL
+    update to a no-op.
+    """
+    from activeqa.reformulator import Reformulator
+    reformulator = object.__new__(Reformulator)
+    pairs = [
+        ("ఎక్కడికక్కడ భక్తులు ఇబ్బంది పడకుండా అన్ని ఏర్పాట్లూ చేసింది ప్రభుత్వం?",
+         "భక్తులకు ఎలాంటి ఇబ్బంది కలగకుండా ప్రభుత్వం అన్ని ఏర్పాట్లు చేసింది?"),
+        ("దీనిపై ఎందుకు సమాధానం చెప్పరని ప్రశ్నించారు?",
+         "ఎందుకు ఈ ప్రశ్నకు సమాధానం చెప్పలేము?"),
+        ("పర అంటే ఏమిటో నాకు నిక్కచ్చిగా తెలియదు?",
+         "నాకు తెలియనిది ఏంటో నాకు తెలీదు?"),
+        ("ఈ విషయంలో జోక్యం చేసుకునే యోచన ఉందా?",
+         "ఈ విషయంలో మీరు జోక్యం చేసుకోవాలనుకుంటున్నారా?"),
+    ]
+    for question, candidate in pairs:
+        assert reformulator._valid(question, candidate), candidate
+
+
+def test_qa_eval_reports_conservative_and_corrective_selection():
+    """The two selectors must both be measured, and both must be safe.
+
+    Question 1: the rewrite keeps an answer consistent with the original's
+    (partial) answer, so the conservative rule may switch on confidence.
+
+    Question 2: the original answer is wrong, so the only helpful rewrite
+    changes the answer. The conservative rule must abstain there; the
+    confidence-override rule must take it. A higher-confidence invalid
+    candidate must never win in either rule.
+    """
+    from activeqa.qa_eval import evaluate_qa_pairs
+
+    class FakeReformulator:
+        def sample_actions(self, question, candidates, *args, **kwargs):
+            table = {
+                "q_consistency": [
+                    {"sampled_text": "delhi government announced",
+                     "candidate": "delhi government announced", "valid": True},
+                    {"sampled_text": "q_consistency",
+                     "candidate": "q_consistency", "valid": False},
+                ],
+                "q_corrective": [
+                    {"sampled_text": "gold", "candidate": "gold", "valid": True},
+                    {"sampled_text": "gold", "candidate": "gold", "valid": False},
+                ],
+            }
+            return table[question]
+
+    class FakeQA:
+        def answer_batch(self, questions, context):
+            table = {
+                # Partial credit, low confidence.
+                "q_consistency": ("delhi government", 0.0, -1.0),
+                # Consistent successor answer, more confident.
+                "delhi government announced": ("delhi government announced", 0.0, -0.4),
+                # Wrong answer, low confidence: this is what reformulation is for.
+                "q_corrective": ("wrong", 0.0, -1.0),
+                "gold": ("gold", 0.0, -0.1),
+            }
+            return [table.get(question, ("wrong", 0.0, -1.0)) for question in questions]
+
+    summary, records = evaluate_qa_pairs(
+        FakeReformulator(), FakeQA(),
+        [{"id": "1", "question": "q_consistency", "context": "c",
+          "answers": ["delhi government announced"]},
+         {"id": "2", "question": "q_corrective", "context": "c",
+          "answers": ["gold"]}],
+        candidates=2, limit=2, label="test")
+
+    by_id = {record["id"]: record for record in records}
+    assert by_id["1"]["switched"] is True
+    assert by_id["1"]["selected_question"] == "delhi government announced"
+    assert by_id["1"]["selected_f1"] == pytest.approx(1.0)
+    assert by_id["1"]["original_f1"] == pytest.approx(0.8)
+
+    # Conservative rule refuses the answer-changing rewrite.
+    assert by_id["2"]["switched"] is False
+    assert by_id["2"]["selected_question"] == "q_corrective"
+    assert by_id["2"]["selected_f1"] == 0.0
+    # Corrective rule takes it, and the invalid candidate still loses.
+    assert by_id["2"]["corrective_switch"] is True
+    assert by_id["2"]["corrective_question"] == "gold"
+    assert by_id["2"]["corrective_f1"] == pytest.approx(1.0)
+
+    assert summary["switch_rate"] == pytest.approx(0.5)
+    # The corrective rule switches on both questions: Q1 for the same
+    # consistent reason as the conservative rule, Q2 via the override.
+    assert summary["corrective_switch_rate"] == pytest.approx(1.0)
+    assert by_id["1"]["corrective_question"] == "delhi government announced"
+    assert summary["original_f1"] == pytest.approx(0.4)
+    assert summary["selected_f1"] == pytest.approx(0.5)
+    assert summary["corrective_f1"] == pytest.approx(1.0)
+    assert summary["improved_rate"] == pytest.approx(0.5)
+    assert summary["harmed_rate"] == 0.0
+    assert summary["valid_generation_rate"] == pytest.approx(0.5)
+    assert summary["distinct_selected_ratio"] == pytest.approx(1.0)
+
+
+def test_rft_takes_an_update_only_for_qualifying_rewrites():
+    import torch
+    from activeqa.rft import rft_on_policy
+
+    class FakeRef:
+        def __init__(self):
+            self.model = torch.nn.Linear(1, 1)
+            torch.nn.init.constant_(self.model.weight, 1.0)
+            torch.nn.init.constant_(self.model.bias, 0.0)
+            self.calls = 0
+
+        def sample_actions_batch(self, questions, candidates, *args, **kwargs):
+            self.calls += 1
+            return [[{"valid": True, "sampled_text": "rewrite", "candidate": "rewrite",
+                      "token_ids": [1, 2]} for _ in range(candidates)]
+                    for _ in questions]
+
+        def sequence_logprob_batch(self, pairs, max_input):
+            return torch.stack([self.model(torch.ones(1, 1))[0, 0] for _ in pairs])
+
+    class FakeQA:
+        def answer_batch(self, questions, context):
+            return [("gold", 0.0, -0.5) for _ in questions]
+
+    ref = FakeRef()
+    before = ref.model.weight.detach().clone()
+    metrics, records = rft_on_policy(
+        ref, FakeQA(),
+        [{"question": "q", "context": "c", "answers": ["gold"]}],
+        candidates=2, batch_questions=1, epochs=1, learning_rate=1e-2,
+        generate_batch=1, log=lambda *_: None)
+    assert metrics["optimizer_steps"] == 1
+    assert metrics["selected_rate"] == 1.0
+    assert len(records) == 1
+    assert not torch.equal(before, ref.model.weight.detach())
+
+
+def test_rft_skips_when_no_rewrite_beats_the_original():
+    import torch
+    from activeqa.rft import rft_on_policy
+
+    class FakeRef:
+        def __init__(self):
+            self.model = torch.nn.Linear(1, 1)
+            self.calls = 0
+
+        def sample_actions_batch(self, questions, candidates, *args, **kwargs):
+            self.calls += 1
+            return [[{"valid": True, "sampled_text": "rewrite", "candidate": "rewrite",
+                      "token_ids": [1]} for _ in range(candidates)]
+                    for _ in questions]
+
+        def sequence_logprob_batch(self, pairs, max_input):
+            raise AssertionError("no update should be attempted")
+
+    class WorseQA:
+        def answer_batch(self, questions, context):
+            # The original answers correctly; every rewrite is wrong.
+            return [("gold", 0.0, -0.5)] + [("nonsense", 0.0, -0.5)] * (len(questions) - 1)
+
+    metrics, records = rft_on_policy(
+        FakeRef(), WorseQA(),
+        [{"question": "q", "context": "c", "answers": ["gold"]}],
+        candidates=3, batch_questions=1, epochs=1, log=lambda *_: None)
+    assert metrics["optimizer_steps"] == 0
+    assert metrics["selected_rate"] == 0.0
+    assert records == []

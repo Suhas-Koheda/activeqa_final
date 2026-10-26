@@ -25,7 +25,8 @@ def main():
     _rewrite_train, rewrite_dev = load_reformulation_splits(cfg["data"])
     ref = Reformulator(cfg["models"]["reformulator"], cfg["models"]["cache_dir"],
                        cfg["models"].get("lora_rank"), cfg["models"].get("lora_alpha"),
-                       device=cfg.get("device", "cpu"))
+                       device=cfg.get("device", "cpu"),
+                       adapter_path=cfg["models"].get("reformulator_adapter"))
     qa = TeluguQA(cfg["models"]["qa"], cfg["models"]["cache_dir"], device=cfg.get("device", "cpu"))
     retriever = Retriever(retrieval_corpus)
 

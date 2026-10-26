@@ -29,9 +29,11 @@ def main():
     train, _evaluation = load_splits(cfg["data"])
     ref = Reformulator(cfg["models"]["reformulator"], cfg["models"]["cache_dir"],
                        cfg["models"].get("lora_rank"), cfg["models"].get("lora_alpha"),
-                       device=cfg.get("device", "cpu"))
+                       device=cfg.get("device", "cpu"),
+                       adapter_path=None if args.base_policy else
+                       cfg["models"].get("reformulator_adapter"))
     checkpoint = args.checkpoint or cfg["training"].get("checkpoint")
-    if not args.base_policy and checkpoint:
+    if not args.base_policy and checkpoint and not ref.adapter_path:
         if not os.path.isfile(checkpoint):
             raise FileNotFoundError(
                 f"Trained adapter not found: {checkpoint}. Run the training workflow first "

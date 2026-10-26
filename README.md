@@ -1,5 +1,37 @@
 # ActiveQA Telugu
 
+## Current pipeline: LoRA SFT → QA-reward RL (one command)
+
+The production path is now:
+
+```bash
+python scripts/kaggle_run_all.py
+```
+
+It runs two stages in sequence on a GPU host:
+
+1. **SFT** (`scripts/colab_run_sft.py`) — LoRA fine-tune of
+   `ai4bharat/MultiIndicParaphraseGenerationSS` on 52,877 Telugu
+   question/paraphrase pairs, with a base-vs-SFT held-out paraphrase evaluation.
+   The last verified run reached token-F1 **0.2698 → 0.2907** with 100% of
+   outputs ending in a question mark, zero Tamil/Kannada/Devanagari spill, and
+   no copies or empties.
+2. **RL** (`scripts/kaggle_run_rl.py`) — on-policy rejection-sampling
+   fine-tuning (RFT) of that adapter with the frozen
+   `l3cube-pune/telugu-question-answering-squad-bert` model as the reward. It
+   then answers 200 held-out `dev.jsonl` questions with the original question
+   and with the confidence-selected rewrite, for the SFT and RL policies, and
+   reports the paired delta plus a bootstrap confidence interval.
+
+Artifacts: `models/indicbartss-reformulator-lora/` (SFT adapter) and
+`models/indicbartss-reformulator-lora-rl/` (RL adapter, `qa_eval.json`,
+per-question predictions). See `KAGGLE_SFT.md` for notebook cells, expected log
+lines, overrides, and failure diagnostics.
+
+The sections below document the earlier full-parameter REINFORCE experiments
+and the research/leakage notes; they are kept for context, not as the current
+recommended path.
+
 ## Telugu reformulation-only REINFORCE
 
 For training the Telugu question rewriter itself, use `scripts/train_telugu_reformulation_rl.py`. This is full-parameter REINFORCE only: no supervised warm-up, no LoRA, no hand-written rewrite templates, and no QA-answer reward. Each sampled output receives a reward from token F1 against the user's reformulation references, while invalid, off-topic, answer-type-changing, foreign-script, and duplicate outputs are penalized. The script filters obvious bad pairs from the 107-question user dataset, splits by source question, writes the filtered JSONL and a rejection report, and keeps the best held-out checkpoint so a later epoch cannot silently replace a better policy.

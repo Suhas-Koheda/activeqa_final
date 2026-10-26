@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import re
 import torch
 from .preprocessing import normalize, entity_signature, interrogatives, tokens
@@ -34,7 +35,14 @@ def _answer_type(text):
 
 def _preserves_answer_type(source, candidate):
     src, dst = _answer_type(source), _answer_type(candidate)
-    if src == dst and src != "unknown": return True
+    if src == dst:
+        return True
+    # Telugu inflects interrogatives heavily and the keyword heuristic misses
+    # many surface forms (e.g. ఎక్కడికక్కడ, ఎలాంటి, ఏంటో). Only reject a rewrite
+    # when both sides map to a *known* and different answer type; otherwise the
+    # QA reward is the authority on whether the answer still matches.
+    if src == "unknown" or dst == "unknown":
+        return True
     # Telugu often changes an explicit “ఎవరు?” into a grammatical “వ్యక్తి పేరు ఏమిటి?”.
     if src == "person" and dst == "thing":
         return bool(re.search(r"పేరు|వ్యక్తి|రచయిత|కళాకార", candidate))
@@ -42,8 +50,15 @@ def _preserves_answer_type(source, candidate):
 
 
 def _anchor_overlap(source, candidate):
-    """Conservative lexical guard against dropping Telugu names/topic words."""
-    source_words = [w for w in tokens(source) if len(w) >= 3 and w not in _TELUGU_FUNCTION_WORDS]
+    """Conservative lexical guard against dropping Telugu names/topic words.
+
+    Only words of four or more characters are considered anchors (short Telugu
+    words are usually particles), and a rewrite needs at least one shared
+    anchor plus 25% of them. The earlier 55% rule rejected most of the SFT
+    model's genuine paraphrases — it treated every content word as a proper
+    name, even though Telugu paraphrases routinely replace verbs and adverbs.
+    """
+    source_words = [w for w in tokens(source) if len(w) >= 4 and w not in _TELUGU_FUNCTION_WORDS]
     target_words = tokens(candidate)
     if not source_words:
         return True
@@ -53,13 +68,14 @@ def _anchor_overlap(source, candidate):
     matched = 0
     for word in source_words:
         if any(word == other or word in other or other in word or
-               SequenceMatcher(None, word, other).ratio() >= .78
+               SequenceMatcher(None, word, other).ratio() >= .70
                for other in target_words):
             matched += 1
-    return matched / len(source_words) >= .55
+    return matched >= 1 and matched / len(source_words) >= .20
 
 class Reformulator:
-    def __init__(self, name, cache_dir="models", rank=None, alpha=None, language="te", device="cpu"):
+    def __init__(self, name, cache_dir="models", rank=None, alpha=None, language="te",
+                 device="cpu", adapter_path=None):
         from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
         # This checkpoint explicitly documents the slow AlbertTokenizer path. `use_fast=True`
         # attempts an unsupported conversion and fails when its legacy vocab_file is None.
@@ -68,10 +84,11 @@ class Reformulator:
             do_lower_case=False, keep_accents=True,
         )
         self.device=torch.device(device)
-        self.model=AutoModelForSeq2SeqLM.from_pretrained(name,cache_dir=cache_dir).to(self.device)
+        self.model=AutoModelForSeq2SeqLM.from_pretrained(name,cache_dir=cache_dir)
         self.model.train()
         self.base_name=name
         self.language=language
+        self.adapter_path=adapter_path
         self.target_lang_token=f"<2{language}>"
         self.target_lang_id=self.tokenizer._convert_token_to_id_with_added_voc(self.target_lang_token)
         if self.target_lang_id == self.tokenizer.unk_token_id:
@@ -92,14 +109,40 @@ class Reformulator:
         self.model.config.eos_token_id=self.eos_token_id
         self.model.generation_config.bos_token_id=self.bos_token_id
         self.model.generation_config.eos_token_id=self.eos_token_id
+        # The SFT/RL adapters were trained against exactly this tokenizer/model
+        # pair; loading them here keeps every stage (training, eval, deployment)
+        # on the same policy instead of silently evaluating the base model.
+        if adapter_path:
+            if not os.path.isdir(adapter_path):
+                raise FileNotFoundError(f"Adapter directory not found: {adapter_path}")
+            from peft import PeftModel
+            self.model = PeftModel.from_pretrained(
+                self.model, adapter_path, is_trainable=True)
+            self.model.print_trainable_parameters()
+        self.model.to(self.device)
+        # A trained adapter expects the checkpoint's embeddings to stay tied. A
+        # pre-release transformers build once produced random, untied tables
+        # here; fail loudly instead of training/decoding on them.
+        from transformers import PreTrainedModel
+        language_model = self.model
+        while not isinstance(language_model, PreTrainedModel):
+            language_model = language_model.get_base_model()
+        shared = language_model.model.shared.weight
+        encoder_embedding = language_model.model.encoder.embed_tokens.weight
+        if encoder_embedding is not shared and not torch.equal(shared, encoder_embedding):
+            raise RuntimeError(
+                "Encoder/decoder embeddings are not tied to model.shared. "
+                "Install transformers==4.57.6 (the checkpoint was trained with "
+                "tied embeddings) before loading this reformulator.")
         self.cache={}
-        # This is a full-parameter policy-gradient run: every reformulator
-        # parameter is trainable. Gradient checkpointing keeps it practical on
-        # Colab T4 GPUs without replacing the RL update with an adapter-only fit.
-        if hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable()
-        if hasattr(self.model.config, "use_cache"):
-            self.model.config.use_cache = False
+        # Full-parameter policy-gradient runs need gradient checkpointing to fit
+        # on a T4. Adapter runs only update ~2.4M LoRA weights, so checkpointing
+        # would add recomputation without a memory benefit.
+        if adapter_path is None:
+            if hasattr(self.model, "gradient_checkpointing_enable"):
+                self.model.gradient_checkpointing_enable()
+            if hasattr(self.model.config, "use_cache"):
+                self.model.config.use_cache = False
         self.trainable=[p for p in self.model.parameters() if p.requires_grad]
         self.trainable_count=sum(p.numel() for p in self.trainable)
 
@@ -114,33 +157,11 @@ class Reformulator:
         """Return display candidates, replacing invalid outputs with the input question."""
         return [x["candidate"] for x in self.sample_actions(question, n, max_input, max_new, do_sample)]
 
-    def sample_actions(self, question, n=2, max_input=96, max_new=64, do_sample=True):
-        """Sample policy actions while retaining the exact generated token IDs.
-
-        Invalid text is exposed as the original question for downstream answer scoring,
-        but the original sampled IDs remain attached for the policy gradient. This keeps
-        the REINFORCE likelihood paired with the actual sampled action.
-        """
-        inp=self._source(question,max_input)
-        was_training=self.model.training
-        self.model.eval()
-        generation_kwargs={"max_new_tokens":max_new,"do_sample":do_sample,
-                           "num_beams":max(1,n) if not do_sample else 1,
-                           "num_return_sequences":n,
-                           "bos_token_id":self.bos_token_id,
-                           "eos_token_id":self.eos_token_id,
-                           "pad_token_id":self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.eos_token_id,
-                           "decoder_start_token_id":self.target_lang_id}
-        generation_kwargs.update(no_repeat_ngram_size=3, encoder_no_repeat_ngram_size=3)
-        if do_sample:
-            generation_kwargs.update(top_p=.9,temperature=.9)
-        with torch.inference_mode():
-            seq=self.model.generate(**inp,**generation_kwargs)
-        self.model.train(was_training)
+    def _decode_actions(self, question, sequences):
         actions=[]
-        for ids in seq:
+        for ids in sequences:
             text=normalize(self.tokenizer.decode(ids,skip_special_tokens=True,clean_up_tokenization_spaces=False))
-            tokens=ids.tolist()
+            tokens=ids.tolist() if hasattr(ids,"tolist") else list(ids)
             terminated = self.eos_token_id in tokens
             if tokens and tokens[0] == self.target_lang_id:
                 tokens=tokens[1:]
@@ -154,6 +175,56 @@ class Reformulator:
                             "valid":valid,"terminated":terminated,"token_ids":tokens,
                             "question_type_preserved":question_type_preserved})
         return actions
+
+    def sample_actions(self, question, n=2, max_input=96, max_new=64, do_sample=True):
+        """Sample policy actions while retaining the exact generated token IDs.
+
+        Invalid text is exposed as the original question for downstream answer scoring,
+        but the original sampled IDs remain attached for the policy gradient. This keeps
+        the REINFORCE likelihood paired with the actual sampled action.
+        """
+        return self.sample_actions_batch([question], n, max_input, max_new, do_sample)[0]
+
+    def sample_actions_batch(self, questions, n=2, max_input=96, max_new=64, do_sample=True):
+        """Sample ``n`` actions for several questions in one generate() call.
+
+        Batching is the main speedup for on-policy RL: eight questions × six
+        candidates cost one encoder pass instead of eight, and the decoder still
+        produces the same number of sequences. Per-question validity/gating is
+        applied after decoding, exactly as in :meth:`sample_actions`.
+        """
+        questions=[normalize(q) for q in questions]
+        if not questions:
+            return []
+        encoded=self.tokenizer(
+            [f"{q} </s> {self.target_lang_token}" for q in questions],
+            add_special_tokens=False, return_tensors="pt", padding=True,
+            truncation=True, max_length=max_input)
+        # AlbertTokenizer can emit token_type_ids even though MBART encoder-decoder
+        # generation does not accept them.
+        inp={key:value.to(self.device) for key,value in encoded.items()
+             if key in {"input_ids","attention_mask"}}
+        was_training=self.model.training
+        self.model.eval()
+        generation_kwargs={"max_new_tokens":max_new,"do_sample":do_sample,
+                           "num_beams":max(1,n) if not do_sample else 1,
+                           "num_return_sequences":n,
+                           "bos_token_id":self.bos_token_id,
+                           "eos_token_id":self.eos_token_id,
+                           "pad_token_id":self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.eos_token_id,
+                           "decoder_start_token_id":self.target_lang_id,
+                           "use_cache":True}
+        generation_kwargs.update(no_repeat_ngram_size=3, encoder_no_repeat_ngram_size=3)
+        if do_sample:
+            generation_kwargs.update(top_p=.9,temperature=.9)
+        try:
+            with torch.inference_mode():
+                seq=self.model.generate(**inp,**generation_kwargs)
+        finally:
+            self.model.train(was_training)
+        # Hugging Face returns all n sequences for input 0, then all n for input 1, ...
+        grouped=seq.reshape(len(questions), n, -1)
+        return [self._decode_actions(q, grouped[index]) for index,q in enumerate(questions)]
 
     def _valid(self, original, candidate, terminated=True):
         # Reaching max_new_tokens without EOS usually means a mid-sentence cut.
@@ -241,4 +312,45 @@ class Reformulator:
         selected=logp.gather(-1,labels.clamp(min=0).unsqueeze(-1)).squeeze(-1)
         return (selected*mask).sum(dim=1)
 
-    def save_adapter(self,path): self.model.save_pretrained(path)
+    def sequence_logprob_batch(self, pairs, max_input=96):
+        """Teacher-force several ``(question, token_ids)`` pairs in one forward pass.
+
+        Used by the on-policy RL update: one optimizer batch contains one selected
+        rewrite per question, so each row has a different source question. Sources
+        are padded, target ids are padded with ``-100`` (never scored), and the
+        returned tensor holds the summed log-probability of each sequence.
+        """
+        if not pairs:
+            raise ValueError("At least one sampled reformulation is required")
+        questions=[normalize(question) for question,_ in pairs]
+        targets=[list(ids) for _,ids in pairs]
+        if any(not ids for ids in targets):
+            raise ValueError("A sampled reformulation must contain at least one generated token")
+        encoded=self.tokenizer(
+            [f"{q} </s> {self.target_lang_token}" for q in questions],
+            add_special_tokens=False, return_tensors="pt", padding=True,
+            truncation=True, max_length=max_input)
+        src={key:value.to(self.device) for key,value in encoded.items()
+             if key in {"input_ids","attention_mask"}}
+        batch=len(targets)
+        max_len=max(len(ids) for ids in targets)
+        labels=torch.full((batch,max_len),-100,dtype=torch.long,device=self.device)
+        mask=torch.zeros((batch,max_len),dtype=torch.bool,device=self.device)
+        for row,ids in enumerate(targets):
+            labels[row,:len(ids)]=torch.tensor(ids,dtype=torch.long,device=self.device)
+            mask[row,:len(ids)]=True
+        # Score under the same (dropout-free) policy that generated the actions.
+        was_training=self.model.training
+        self.model.eval()
+        try:
+            out=self.model(**src,labels=labels)
+        finally:
+            self.model.train(was_training)
+        logp=torch.log_softmax(out.logits,dim=-1)
+        selected=logp.gather(-1,labels.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+        return (selected*mask).sum(dim=1)
+
+    def save_adapter(self,path):
+        os.makedirs(path,exist_ok=True)
+        self.model.save_pretrained(path)
+        self.tokenizer.save_pretrained(path)

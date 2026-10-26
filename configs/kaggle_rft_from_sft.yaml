@@ -1,0 +1,58 @@
+# RL stage that starts from the SFT adapter produced by scripts/colab_run_sft.py.
+#
+# This is the config-driven equivalent of scripts/kaggle_run_rl.py: on-policy
+# rejection-sampling fine-tuning (RFT) with the frozen Telugu QA model as the
+# reward. Use the script for the one-command Kaggle/Colab flow; this file is for
+# scripts/train.py + scripts/evaluate.py when you want the config paths.
+#
+#   python scripts/train.py --config configs/kaggle_rft_from_sft.yaml
+#   python scripts/evaluate.py --config configs/kaggle_rft_from_sft.yaml \
+#          --checkpoint outputs/kaggle_rft_from_sft_policy.pt
+device: cuda
+seed: 42
+cpu_threads: 4
+data:
+  dataset: ai4bharat/IndicQA
+  config: indicqa.te
+  cache_dir: data/cache
+  external_train_file: data/indic_rag_te/train.jsonl
+  train_examples: 320
+  eval_examples: 300
+  eval_fraction: 0.2
+models:
+  reformulator: ai4bharat/MultiIndicParaphraseGenerationSS
+  # Trained by scripts/colab_run_sft.py. train.py only updates these LoRA
+  # weights; checkpoints store the adapter, not the frozen 246M base model.
+  reformulator_adapter: models/indicbartss-reformulator-lora/adapter
+  qa: l3cube-pune/telugu-question-answering-squad-bert
+  cache_dir: models
+generation:
+  candidates_per_question: 6
+  max_input_tokens: 96
+  max_new_tokens: 64
+  do_sample: true
+retrieval:
+  top_k: 3
+  max_context_chars: 1200
+training:
+  method: rft
+  epochs: 2
+  learning_rate: 0.00007
+  batch_questions: 8
+  min_reward_margin: 0.0
+  # Allow a rewrite to be taught even if its span confidence is up to 0.25
+  # lower than the original's; 0.0 is stricter but selects fewer samples.
+  confidence_slack: 0.25
+  optimizer: adamw
+  weight_decay: 0.0
+  gradient_clip_norm: 1.0
+  keep_step_checkpoints: true
+  checkpoint_every_steps: 25
+  checkpoint: outputs/kaggle_rft_from_sft_policy.pt
+  adapter_out: models/indicbartss-reformulator-lora-rl/adapter
+evaluation:
+  do_sample: true
+  # Deployment selector: highest span confidence with answer consistency.
+  selection: confidence
+  retrieval_metrics: false
+outputs: outputs

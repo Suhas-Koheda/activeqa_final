@@ -33,7 +33,8 @@ from activeqa.preprocessing import entity_signature
 from activeqa.qa_model import TeluguQA
 from activeqa.reformulator import Reformulator
 from activeqa.rewards import reward, token_f1
-from activeqa.utils import load_config, setup_cpu, make_policy_optimizer, load_policy_state
+from activeqa.utils import (load_config, setup_cpu, make_policy_optimizer,
+                            load_policy_state, policy_state)
 
 
 def step_checkpoint_path(path, step):
@@ -44,7 +45,7 @@ def step_checkpoint_path(path, step):
 def save_checkpoint(path, ref, optimizer, update_step, action_step):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save({
-        "model_state": ref.model.state_dict(),
+        **policy_state(ref.model),
         "optimizer": optimizer.state_dict(),
         "update_step": update_step,
         "action_step": action_step,
@@ -66,6 +67,7 @@ def main():
     if method not in {"reinforce", "rft"}:
         raise ValueError(f"Unknown training.method={method!r}; use 'reinforce' or 'rft'")
     margin = float(cfg["training"].get("min_reward_margin", 0.0))
+    confidence_slack = float(cfg["training"].get("confidence_slack", 0.0))
     collect_selector_data = bool(cfg["training"].get("collect_selector_data", False))
     selector_records = []
     selector_path = os.path.join("outputs", "selector_dataset.jsonl")
@@ -94,9 +96,11 @@ def main():
     started = time.perf_counter()
     ref = Reformulator(cfg["models"]["reformulator"], cfg["models"]["cache_dir"],
                        cfg["models"].get("lora_rank"), cfg["models"].get("lora_alpha"),
-                       device=cfg.get("device", "cpu"))
+                       device=cfg.get("device", "cpu"),
+                       adapter_path=cfg["models"].get("reformulator_adapter"))
     print(f"reformulator_load_seconds={time.perf_counter()-started:.1f}; "
-          f"trainable_parameters={ref.trainable_count}", flush=True)
+          f"trainable_parameters={ref.trainable_count}; "
+          f"adapter={cfg['models'].get('reformulator_adapter')}", flush=True)
     if bool(cfg["training"].get("sft_warmup", False)):
         if not args.resume:
             sft_checkpoint = cfg["training"].get(
@@ -114,7 +118,19 @@ def main():
     qa = TeluguQA(cfg["models"]["qa"], cfg["models"]["cache_dir"], device=cfg.get("device", "cpu"))
     print(f"qa_load_seconds={time.perf_counter()-qa_started:.1f}", flush=True)
 
-    optimizer = make_policy_optimizer(ref.trainable, cfg["training"]["learning_rate"])
+    optimizer_name = str(cfg["training"].get(
+        "optimizer", "adamw" if ref.adapter_path else "adafactor")).lower()
+    if optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(ref.trainable,
+                                      lr=float(cfg["training"]["learning_rate"]),
+                                      weight_decay=float(
+                                          cfg["training"].get("weight_decay", 0.0)))
+    elif optimizer_name == "adafactor":
+        optimizer = make_policy_optimizer(ref.trainable,
+                                          cfg["training"]["learning_rate"])
+    else:
+        raise ValueError(f"Unknown training.optimizer={optimizer_name!r}")
+    print(f"optimizer={optimizer_name} trainable_tensors={len(ref.trainable)}", flush=True)
     checkpoint = cfg["training"]["checkpoint"]
     checkpoint_every = int(cfg["training"].get("checkpoint_every_steps", 0))
     keep_step_checkpoints = bool(cfg["training"].get("keep_step_checkpoints", False))
@@ -268,7 +284,7 @@ def main():
                     (i for i in range(len(sampled))
                      if sampled[i]["valid"]
                      and values[i] >= original_reward + margin
-                     and confidences[i] >= original_confidence),
+                     and confidences[i] >= original_confidence - confidence_slack),
                     key=lambda i: values[i], default=None)
                 diag_index = max(range(len(sampled)), key=values.__getitem__)
                 best_action = sampled[diag_index]
@@ -383,6 +399,10 @@ def main():
     flush_batch(epochs)
     write_selector_dataset()
     save_checkpoint(checkpoint, ref, optimizer, update_step, action_step)
+    adapter_out = cfg["training"].get("adapter_out")
+    if adapter_out:
+        ref.save_adapter(adapter_out)
+        print(f"adapter_saved={adapter_out}", flush=True)
     os.makedirs("outputs", exist_ok=True)
     elapsed = elapsed_offset + (time.perf_counter() - started)
 
