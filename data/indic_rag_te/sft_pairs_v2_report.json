@@ -1,52 +1,14 @@
 {
+  "dataset": "nlpctx/telugu-qa-codemixed (used as-is)",
+  "parquet": "/home/ssp/projects/Python/active_qa_final/data/external/telugu_qa_codemixed/train.parquet",
   "out_file": "/home/ssp/projects/Python/active_qa_final/data/indic_rag_te/sft_pairs_v2.jsonl",
-  "questions": 12522,
-  "pairs": 29753,
-  "tier_pairs": {
-    "qa_train_rule": 848,
-    "rule_curated": 4,
-    "curated_user": 70,
-    "corpus_rule": 7577,
-    "codemixed_translit": 18237,
-    "codemixed_native": 3017
+  "questions": 7687,
+  "pairs": 24883,
+  "skipped": {
+    "native_truncated": 1046,
+    "native_missing": 221,
+    "native_tamil": 8,
+    "docs_without_pairs": 4
   },
-  "tier_questions": {
-    "codemixed_translit": 7264,
-    "codemixed_native": 3010,
-    "corpus_rule": 4623,
-    "curated_user": 60,
-    "qa_train_rule": 415,
-    "rule_curated": 240
-  },
-  "rule_hits": {
-    "where": 688,
-    "kind": 2070,
-    "what": 1185,
-    "when": 241,
-    "where_to": 52,
-    "how": 2237,
-    "quantity": 27,
-    "why": 1529,
-    "who": 332,
-    "where_from": 54,
-    "year": 10
-  },
-  "rejections": {
-    "multi_sentence": 41,
-    "rare_retention": 12,
-    "bad_target_text": 99,
-    "jaccard": 95,
-    "question_type": 67,
-    "bad_source_text": 172,
-    "length_ratio": 85,
-    "entity_dropped": 6,
-    "exact_copy": 933,
-    "entity_invented": 52,
-    "anchor_dropped": 3332
-  },
-  "dev_questions_skipped": 0,
-  "train_questions": 802,
-  "curated_sources": 399,
-  "corpus_questions_used": 12000,
   "pairs_per_question_max": 8
 }

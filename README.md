@@ -11,12 +11,13 @@ python scripts/kaggle_run_all.py
 It runs two stages in sequence on a GPU host:
 
 1. **SFT** (`scripts/colab_run_sft.py`) — LoRA fine-tune of
-   `ai4bharat/MultiIndicParaphraseGenerationSS` on the 29,753 validated pairs
-   in `data/indic_rag_te/sft_pairs_v2.jsonl` (built by
-   `scripts/build_sft_dataset.py`: rule-generated rewrites over real QA
-   questions, curated user pairs, and reformulation pairs mined AS-IS from
+   `ai4bharat/MultiIndicParaphraseGenerationSS` on the 24,883 pairs in
+   `data/indic_rag_te/sft_pairs_v2.jsonl`, built with **only** the
    [`nlpctx/telugu-qa-codemixed`](https://huggingface.co/datasets/nlpctx/telugu-qa-codemixed)
-   — code-mixed→native-Telugu rewrites included, dataset content unmodified),
+   dataset, used as-is — code-mixed rewrites paired within each doc and, when
+   complete, into the native-Telugu level-5 rewrite. The dataset content is
+   never modified (only truncated/junk cells are skipped), and no rule- or
+   regex-generated targets exist anymore,
    with a base-vs-SFT held-out paraphrase evaluation.
    The last verified run reached token-F1 **0.2698 → 0.2907** with 100% of
    outputs ending in a question mark, zero Tamil/Kannada/Devanagari spill, and

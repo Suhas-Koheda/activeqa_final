@@ -3,11 +3,12 @@
 The whole Telugu reformulator pipeline now runs as a single command:
 
 1. **SFT** — LoRA fine-tune `ai4bharat/MultiIndicParaphraseGenerationSS` on the
-   29,753 validated pairs in `data/indic_rag_te/sft_pairs_v2.jsonl`
-   (rule-generated rewrites, curated user pairs, and reformulation pairs mined
-   AS-IS from [`nlpctx/telugu-qa-codemixed`](https://huggingface.co/datasets/nlpctx/telugu-qa-codemixed);
-   the codemixed dataset's content is never modified, only selected), with a
-   base-vs-SFT held-out evaluation on identical questions.
+   24,883 pairs in `data/indic_rag_te/sft_pairs_v2.jsonl`, built from **only**
+   [`nlpctx/telugu-qa-codemixed`](https://huggingface.co/datasets/nlpctx/telugu-qa-codemixed),
+   used as-is (code-mixed rewrites paired within each doc; complete native-Telugu
+   level-5 rewrites as extra targets; dataset content never modified, only
+   truncated/junk cells skipped), with a base-vs-SFT held-out evaluation on
+   identical questions.
 2. **RL** — load that adapter and run on-policy rejection-sampling fine-tuning
    (RFT) with the frozen `l3cube-pune/telugu-question-answering-squad-bert` QA
    model as the reward.
