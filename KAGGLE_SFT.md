@@ -67,14 +67,17 @@ else:
 ## Useful overrides
 
 ```python
+# force fp32 (the script auto-probes fp16 and falls back if the loss is non-finite)
+!cd /kaggle/working/activeqa_final && python scripts/colab_run_sft.py --amp fp32
+
 # 2 epochs if the first run still copies the question too often
 !cd /kaggle/working/activeqa_final && python scripts/colab_run_sft.py --epochs 2 --lr 1.5e-4
 
 # bigger batch if VRAM allows (T4 16 GB handles 64 fine)
 !cd /kaggle/working/activeqa_final && python scripts/colab_run_sft.py --batch-size 64
 
-# skip dependency reinstall on a warm session
-!cd /kaggle/working/activeqa_final && python scripts/colab_run_sft.py --skip-install
+# skip dependency reinstall / baseline eval on a warm session
+!cd /kaggle/working/activeqa_final && python scripts/colab_run_sft.py --skip-install --no-baseline
 ```
 
 ## What the run proves

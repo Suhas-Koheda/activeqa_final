@@ -100,6 +100,8 @@ def parse_args() -> argparse.Namespace:
                     help="skip the pre-SFT held-out eval (saves a few minutes)")
     ap.add_argument("--lora-mlp", action="store_true",
                     help="also adapt fc1/fc2 (more capacity, more VRAM)")
+    ap.add_argument("--amp", default="auto", choices=("auto", "fp16", "fp32"),
+                    help="auto probes fp16 and falls back to fp32 on non-finite loss")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--skip-install", action="store_true")
     ap.add_argument("--no-cache", action="store_true")
@@ -397,7 +399,7 @@ def main() -> None:
 
     use_cuda = torch.cuda.is_available() and not args.smoke
     device = "cuda" if use_cuda else "cpu"
-    use_amp = use_cuda
+    use_amp = use_cuda and args.amp != "fp32"
     amp_dtype = None
     if use_cuda:
         torch.backends.cudnn.benchmark = True
@@ -405,7 +407,7 @@ def main() -> None:
         amp_dtype = torch.bfloat16 if capability >= 8 else torch.float16
         log(f"GPU: {torch.cuda.get_device_name(0)}  "
             f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GiB  "
-            f"amp={str(amp_dtype).replace('torch.', '')}")
+            f"amp={args.amp}")
     else:
         log("No GPU -> CPU smoke mode (correctness check only, not a real run).")
 
@@ -521,6 +523,20 @@ def main() -> None:
     model.to(device)
     record_status(status_path, "lora_ready")
 
+    # ── AMP probe (Kaggle T4/torch 2.11 produced NaN under fp16 autocast) ────
+    if use_amp:
+        probe_src, probe_mask, probe_labels = collate(train_flat[:4], pad_id, device)
+        with torch.no_grad(), torch.autocast("cuda", dtype=amp_dtype):
+            probe_loss = model(input_ids=probe_src, attention_mask=probe_mask,
+                               labels=probe_labels).loss
+        probe_value = float(probe_loss)
+        log(f"      AMP probe ({str(amp_dtype).replace('torch.', '')}): "
+            f"loss={probe_value:.4f} finite={math.isfinite(probe_value)}")
+        if not math.isfinite(probe_value):
+            log("      non-finite under autocast -> training in fp32")
+            use_amp = False
+            scaler = None
+
     # ── train ────────────────────────────────────────────────────────────────
     steps_per_epoch = math.ceil(len(train_flat) / args.batch_size)
     total_steps = max(1, int(steps_per_epoch * args.epochs))
@@ -544,6 +560,8 @@ def main() -> None:
     model.train()
     started = time.perf_counter()
     step = 0
+    optimizer_steps = 0
+    skipped_batches = 0
     losses = []
     epoch = 0
     while step < total_steps:
@@ -558,20 +576,41 @@ def main() -> None:
             with amp_context:
                 out = model(input_ids=src, attention_mask=src_mask, labels=labels)
                 loss = out.loss
+            loss_value = float(loss.item())
+            if not math.isfinite(loss_value):
+                skipped_batches += 1
+                opt.zero_grad(set_to_none=True)
+                if use_amp:
+                    log(f"      non-finite loss at step {step + 1}; "
+                        f"disabling autocast and continuing in fp32")
+                    use_amp = False
+                    scaler = None
+                    continue
+                if skipped_batches > 5:
+                    raise SystemExit(
+                        "Loss is non-finite even in fp32 — aborting instead of "
+                        "saving a no-op adapter. Check the batch and labels.")
+                log(f"      skipped non-finite batch ({skipped_batches})")
+                continue
             if scaler is not None:
+                scale_before = scaler.get_scale()
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(trainable, 1.0)
                 scaler.step(opt)
                 scaler.update()
+                stepped = scaler.get_scale() >= scale_before
             else:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(trainable, 1.0)
                 opt.step()
-            scheduler.step()
+                stepped = True
+            if stepped:
+                scheduler.step()
+                optimizer_steps += 1
             opt.zero_grad(set_to_none=True)
             step += 1
-            losses.append(float(loss.item()))
+            losses.append(loss_value)
             if step == 1:
                 log(f"      first loss {losses[0]:.4f} "
                     f"(≈1.2 for this checkpoint; >6 means the token embeddings "
@@ -587,9 +626,14 @@ def main() -> None:
                     f"{rate:.2f} it/s" + (f" peak={peak:.1f}GB" if use_cuda else ""))
         epoch += 1
 
+    if optimizer_steps == 0:
+        raise SystemExit(
+            "No optimizer steps were taken (all losses non-finite or all steps "
+            "skipped) — refusing to save a no-op adapter.")
     elapsed = time.perf_counter() - started
-    log(f"      done: {step} steps in {elapsed / 60:.1f} min, "
-        f"mean loss {sum(losses) / len(losses):.4f}")
+    log(f"      done: {step} steps ({optimizer_steps} optimizer updates) in "
+        f"{elapsed / 60:.1f} min, mean loss {sum(losses) / len(losses):.4f}, "
+        f"fp16_amp={'on' if use_amp else 'off'}")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -597,7 +641,7 @@ def main() -> None:
     tok.save_pretrained(str(out_dir))
     log(f"[6/7] Adapter saved: {out_dir}")
     record_status(status_path, "adapter_saved", steps=step,
-                  seconds=round(elapsed, 1))
+                  optimizer_steps=optimizer_steps, seconds=round(elapsed, 1))
 
     # ── held-out eval (post-SFT) ─────────────────────────────────────────────
     log(f"[7/7] Held-out eval — SFT adapter, "
@@ -609,6 +653,8 @@ def main() -> None:
                   distinct_best_ratio=summary["distinct_best_ratio"])
     summary.update({
         "train_steps": step,
+        "optimizer_steps": optimizer_steps,
+        "amp_mode": "fp16" if use_amp else "fp32",
         "train_seconds": round(elapsed, 1),
         "final_loss": round(sum(losses[-200:]) / len(losses[-200:]), 4),
         "base_model": MODEL_ID,
