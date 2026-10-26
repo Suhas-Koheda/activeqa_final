@@ -45,7 +45,36 @@ pair file; the latest one (commit `4296c6f`) trains SFT on **only**
 [`nlpctx/telugu-qa-codemixed`](https://huggingface.co/datasets/nlpctx/telugu-qa-codemixed),
 used as-is (24,883 pairs / 7,687 questions).
 
-Latest run (SFT data = telugu-qa-codemixed only):
+Latest run (SFT data = telugu-qa-codemixed only, 3 epochs + fc1/fc2 LoRA,
+4 targets/question — 24,351 train pairs):
+
+| rule | F1 |
+| --- | --- |
+| original question (do nothing) | **0.7720** |
+| SFT + consistent selector | 0.7739 |
+| SFT + consensus | 0.7690 |
+| SFT + corrective, best margin (+2.0) | 0.7762 |
+| RL + consistent selector | 0.7677 |
+| generation oracle (SFT) | 0.7957 |
+
+For the first time the SFT policy's selected rewrite edges above the
+do-nothing baseline (0.7739 vs 0.7720), but the margin is well inside noise
+and no rule clears a paired CI above zero, so the deployment verdict is
+unchanged: answer the original. Notable in this run:
+
+* Longer SFT + MLP LoRA made the rewriter visibly more fluent (raw demo
+  outputs are complete, natural questions; native-Telugu inputs get fully
+  correct entity-preserving paraphrases).
+* The paraphrase token-F1 *fell* (0.3472 → 0.2599) for a measurable reason:
+  the stronger model now often answers code-mixed input with **native
+  Telugu script**, while held-out references are the dataset's code-mixed
+  variant — cross-script token overlap punishes a stylistically better
+  output. Treat mainly-literal token-F1 as unreliable across these style
+  shifts.
+* The RL stage now *hurt* (selected −0.0062, oracle −0.0229): RFT degraded
+  a stronger SFT start. Keep the SFT adapter; do not deploy the RL one.
+
+Previous run (SFT data = telugu-qa-codemixed only, 1 epoch):
 
 | rule | F1 |
 | --- | --- |
