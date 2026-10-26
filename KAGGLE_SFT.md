@@ -51,9 +51,9 @@ GPU: Tesla T4  14.6 GiB  amp=auto
 embeddings tied to checkpoint shared table
 AMP probe (float16): loss=nan finite=False
 non-finite under autocast -> training in fp32
-first loss 2.6
-done: 1102 steps (1102 optimizer updates) ... fp16_amp=off
-token_f1 0.2698 → 0.2907   delta_token_f1 0.0209
+first loss ≈3.7 on the codemixed pairs (>6 means the embeddings did not load; see run.log)
+done: 314 steps (314 optimizer updates) ... fp16_amp=off
+token_f1 0.1264 → 0.3472   delta_token_f1 0.2208
 ...
 [1/6] RL stage — transformers 4.57.6  peft ...
       trainable params: 2,359,296
@@ -71,10 +71,14 @@ token_f1 0.2698 → 0.2907   delta_token_f1 0.0209
   RL − SFT selected_f1: +0.0xx   paired 95% CI [...]
   RL − SFT corrective_f1: +0.0xx paired 95% CI [...]
   RL − SFT consensus_f1: +0.0xx  paired 95% CI [...]
-  SFT confidence-margin sweep: 0.00→0.7666  0.10→...  ...
-  SFT confidence-gate sweep: best q=... → ... (original ...); ceiling ...
-  Original question F1: 0.7720   best policy+selector: ...
+  SFT confidence-margin sweep: 0.00→0.7638  0.25→0.7649  ...  1.00→0.7720
+  SFT confidence-gate sweep: best q=... → ... (original 0.7720); ceiling ...
+  SFT corrective sweep: best margin 2.00 → 0.7762  | best gate+margin ... → ...
+  Deployable rule (CI above zero): none
+  Original question F1: 0.7720   best policy+selector: 0.7638 (sft/consistent)
   Verdict: ... → use the SFT/RL adapter with the ... selector
+  DEPLOYMENT: do not rewrite. No selector clears the original question with
+  a CI above zero on this held-out set.
 ```
 
 Reading the RL verdict:

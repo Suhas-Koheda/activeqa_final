@@ -40,6 +40,36 @@ reformulation is not worth deploying for that policy.
 
 ### Measured result (held-out `dev.jsonl`, 200 questions)
 
+Two runs are on record: the previous one trained on the older multi-source
+pair file; the latest one (commit `4296c6f`) trains SFT on **only**
+[`nlpctx/telugu-qa-codemixed`](https://huggingface.co/datasets/nlpctx/telugu-qa-codemixed),
+used as-is (24,883 pairs / 7,687 questions).
+
+Latest run (SFT data = telugu-qa-codemixed only):
+
+| rule | F1 |
+| --- | --- |
+| original question (do nothing) | **0.7720** |
+| SFT + consistent selector | 0.7638 |
+| RL + consistent selector | 0.7698 |
+| RL + corrective, best margin (+2.0) | 0.7762 |
+| RL + consensus | 0.7572 |
+| generation oracle (RL) | 0.7952 |
+
+The RL − SFT selected delta is +0.0060 with paired 95% CI [−0.0008, +0.0131]
+— the interval touches zero, and the corrective/consensus intervals are
+wider still ([-0.0114, +0.0544] and [-0.0139, +0.0474]). No policy or
+selector clears the original question with a CI above zero, so verdict and
+deployment again say: answer the original question. Training with the
+code-mixed dataset alone did improve the paraphrase stage itself far more
+than before (token-F1 0.1264 → 0.3472 on its own held-out pairs, all
+outputs ending in "?", zero foreign-script spill), and RL raised the
+generation oracle from 0.7798 to 0.7952 (+0.0154) — the policy produces
+better rewrites even though the selector still cannot beat answering
+the unmodified question.
+
+Previous run (older multi-source pair file):
+
 | rule | F1 |
 | --- | --- |
 | original question (do nothing) | **0.7720** |
@@ -54,10 +84,9 @@ zero questions improve, and the best achievable rule is abstention. The
 question-level signal is weak (AUC 0.699 for low original confidence, 0.628 for
 confidence gain), and high confidence gain mostly indicates a *drifted* rewrite
 that the QA model answers confidently. RL fine-tuning was also negative
-(`selected_f1` 0.7666 → 0.7658 and 0.7657 in two runs). The honest deployment
-is therefore to answer the original question; the SFT adapter is kept because
-it improves paraphrase quality (token-F1 0.2698 → 0.2907) and is the base for
-future work.
+(`selected_f1` 0.7666 → 0.7658 and 0.7657 in two runs). In both runs the
+honest deployment is to answer the original question; the SFT adapter is kept
+because it improves paraphrase quality and is the base for future work.
 
 Artifacts: `models/indicbartss-reformulator-lora/` (SFT adapter) and
 `models/indicbartss-reformulator-lora-rl/` (RL adapter, `qa_eval.json`,
