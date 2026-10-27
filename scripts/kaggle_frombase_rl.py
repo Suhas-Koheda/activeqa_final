@@ -140,15 +140,19 @@ def ensure_deps() -> None:
     5.x loads this checkpoint without tying its shared embedding table, which
     collapses every output to the same string. Only an exact version match is
     safe, and the restart avoids keeping already-imported 5.x modules alive.
+
+    torchao is removed on every path: Kaggle ships 0.10.0 and peft refuses to
+    inject LoRA while that version is importable, even though this pipeline
+    never uses torchao at all.
     """
+    subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     current = installed_transformers()
     if current == PINNED_TRANSFORMERS:
         log(f"[deps] transformers {current} already installed")
         return
     log(f"[deps] installing transformers {PINNED_TRANSFORMERS} "
         f"(found {current or 'none'}) …")
-    subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "torchao"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "-q",
         f"transformers=={PINNED_TRANSFORMERS}", "peft>=0.13,<0.22",
