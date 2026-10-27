@@ -161,11 +161,15 @@ class Reformulator:
         language_model = self.model
         while not isinstance(language_model, PreTrainedModel):
             language_model = language_model.get_base_model()
-        shared = language_model.model.shared.weight
-        encoder_embedding = language_model.model.encoder.embed_tokens.weight
-        if encoder_embedding is not shared and not torch.equal(shared, encoder_embedding):
+        # Architecture-generic: mBART nests the shared table at model.shared
+        # while mT5 keeps it on the top-level module; get_input_embeddings()
+        # and get_decoder() exist on both conditional-generation classes.
+        encoder_embedding = language_model.get_input_embeddings().weight
+        decoder_embedding = language_model.get_decoder().embed_tokens.weight
+        if (decoder_embedding is not encoder_embedding
+                and not torch.equal(decoder_embedding, encoder_embedding)):
             raise RuntimeError(
-                "Encoder/decoder embeddings are not tied to model.shared. "
+                "Encoder/decoder embeddings are not tied to the shared table. "
                 "Install transformers==4.57.6 (the checkpoint was trained with "
                 "tied embeddings) before loading this reformulator.")
         self.cache={}

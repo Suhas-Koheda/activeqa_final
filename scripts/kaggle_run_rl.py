@@ -212,13 +212,21 @@ def resolve_model_path(model_id: str = MODEL_ID) -> str:
     if local.is_dir() and (list(local.glob("*.safetensors"))
                            or list(local.glob("*.bin"))):
         return str(local)
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import HfApi, snapshot_download
+    ignore = ["*.msgpack", "flax_model*", "tf_model*",
+              "rust_model*", "*.onnx", "onnx/*", "*.mlmodel",
+              "*.h5", "*.png", "*.jpg", "*.pdf"]
+    # Repos often ship the same weights twice (model.safetensors AND
+    # pytorch_model.bin); when safetensors exists, never fetch the .bin.
+    try:
+        files = HfApi().list_repo_files(model_id)
+        if any(f.endswith(".safetensors") for f in files):
+            ignore.insert(0, "*.bin")
+    except Exception:
+        pass
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-    return snapshot_download(
-        repo_id=model_id, local_dir=str(local),
-        ignore_patterns=["*.msgpack", "flax_model*", "tf_model*",
-                         "rust_model*", "*.onnx", "onnx/*", "*.mlmodel",
-                         "*.h5", "*.png", "*.jpg", "*.pdf"])
+    return snapshot_download(repo_id=model_id, local_dir=str(local),
+                             ignore_patterns=ignore)
 
 
 def adapter_ready(path: Path) -> bool:
