@@ -1,8 +1,8 @@
 """On-policy rejection-sampling fine-tuning (RFT) for Telugu reformulation.
 
-The SFT adapter is a good paraphraser, but it was trained to imitate reference
-paraphrases, not to make a downstream QA model answer correctly. This stage
-closes that gap with the frozen Telugu QA model as the reward:
+The reference paraphraser imitates token labels instead of making a downstream
+QA model answer correctly. This stage closes that gap with the frozen Telugu
+QA model as the reward:
 
 1. Sample ``candidates`` rewrites per question from the current policy.
 2. Answer the original question and every rewrite on the same passage.
@@ -27,7 +27,7 @@ import time
 import torch
 
 from .preprocessing import entity_signature
-from .policy_gradient import sft_batch_step
+from .policy_gradient import batch_loss_step
 from .rewards import reward, token_f1
 
 
@@ -93,7 +93,7 @@ def rft_on_policy(ref, qa, rows, *, candidates=6, batch_questions=8,
             return None
         try:
             logprobs = ref.sequence_logprob_batch(pending, max_input)
-            loss = sft_batch_step(list(logprobs), optimizer, trainable, clip=1.0)
+            loss = batch_loss_step(list(logprobs), optimizer, trainable, clip=1.0)
         except (FloatingPointError, RuntimeError) as exc:
             update_skipped += 1
             optimizer.zero_grad(set_to_none=True)

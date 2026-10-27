@@ -54,8 +54,8 @@ def _anchor_overlap(source, candidate):
 
     Only words of four or more characters are considered anchors (short Telugu
     words are usually particles), and a rewrite needs at least one shared
-    anchor plus 25% of them. The earlier 55% rule rejected most of the SFT
-    model's genuine paraphrases — it treated every content word as a proper
+    anchor plus 25% of them. The earlier 55% rule rejected most genuine
+    paraphrases — it treated every content word as a proper
     name, even though Telugu paraphrases routinely replace verbs and adverbs.
     """
     source_words = [w for w in tokens(source) if len(w) >= 4 and w not in _TELUGU_FUNCTION_WORDS]
@@ -132,7 +132,7 @@ class Reformulator:
             self.model.generation_config.eos_token_id=self.eos_token_id
         # The IndicBART-SS tokenizer emits token_type_ids even though mBART
         # encoder-decoder generation does not accept them; other tokenizers may too.
-        # The SFT/RL adapters were trained against exactly this tokenizer/model
+        # Adapters were trained against exactly this tokenizer/model
         # pair; loading them here keeps every stage (training, eval, deployment)
         # on the same policy instead of silently evaluating the base model.
         if adapter_path:

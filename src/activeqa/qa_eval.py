@@ -1,8 +1,9 @@
 """Paired held-out QA evaluation for a reformulation policy.
 
-The SFT script measures paraphrase quality (token-F1 against reference
-rewrites). This module measures the thing that actually matters: does the
-deployment pipeline answer a held-out question better after reformulation?
+Reference-paraphrase scoring measures paraphrase quality (token-F1 against
+reference rewrites). This module measures the thing that actually matters:
+does the deployment pipeline answer a held-out question better after
+reformulation?
 
 Every question is answered twice on its own passage:
 
@@ -123,7 +124,7 @@ def paired_delta_ci(records_a, records_b, key, samples=1000):
     """Bootstrap CI for mean(a[key] - b[key]) over aligned per-question rows.
 
     ``summary["delta_ci95"]`` compares one policy against the original
-    question. That is not the interval for RL − SFT, where both policies are
+    question. That is not the interval for RL − start, where both policies are
     evaluated on the same rows and their per-question difference must be
     bootstrapped directly.
     """

@@ -23,7 +23,7 @@ def reinforce_step(logprob,reward_value,baseline,optimizer,params,clip=1.0):
     return float(loss.detach()),adv
 
 
-def sft_batch_step(logprobs, optimizer, params, clip=1.0):
+def batch_loss_step(logprobs, optimizer, params, clip=1.0):
     """Teacher-forcing update on selected high-reward sequences.
 
     Used by rejection-sampling fine-tuning: only sequences that were sampled,
@@ -36,14 +36,14 @@ def sft_batch_step(logprobs, optimizer, params, clip=1.0):
         raise ValueError("At least one target sequence is required")
     loss = -torch.stack(logprobs).mean()
     if not torch.isfinite(loss):
-        raise FloatingPointError("non-finite SFT loss")
+        raise FloatingPointError("non-finite loss")
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     grads = [p.grad for p in params if p.grad is not None]
     if not grads:
-        raise RuntimeError("SFT produced no trainable gradients")
+        raise RuntimeError("policy step produced no trainable gradients")
     if not all(torch.isfinite(g).all() for g in grads):
-        raise FloatingPointError("non-finite SFT gradient")
+        raise FloatingPointError("non-finite gradient")
     torch.nn.utils.clip_grad_norm_(params, clip)
     optimizer.step()
     return float(loss.detach())
