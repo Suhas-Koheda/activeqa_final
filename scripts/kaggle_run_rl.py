@@ -190,7 +190,25 @@ def ensure_deps() -> None:
 
 
 def resolve_model_path(model_id: str = MODEL_ID) -> str:
-    local = ROOT / "models" / model_id.split("/")[-1]
+    """Materialize ``model_id`` on disk and return the local snapshot path.
+
+    Only the PyTorch weights are downloaded — many HF repos carry ONNX/TF/
+    rust duplicates that are several GB each and useless to this pipeline.
+    The download location is the candidate directory with the most free
+    space (on Kaggle ``/kaggle/tmp`` is a tens-of-GB scratch disk while
+    ``/kaggle/working`` can be nearly full).
+    """
+    import shutil
+    candidates = [ROOT / "models", Path("/kaggle/tmp")]
+    best, best_free = candidates[0], -1
+    for cand in candidates:
+        try:
+            free = shutil.disk_usage(str(cand)).free
+        except OSError:
+            free = -1
+        if free > best_free:
+            best, best_free = cand, free
+    local = best / model_id.split("/")[-1]
     if local.is_dir() and (list(local.glob("*.safetensors"))
                            or list(local.glob("*.bin"))):
         return str(local)
@@ -198,7 +216,9 @@ def resolve_model_path(model_id: str = MODEL_ID) -> str:
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     return snapshot_download(
         repo_id=model_id, local_dir=str(local),
-        ignore_patterns=["*.msgpack", "flax_model*", "tf_model*", "rust_model*"])
+        ignore_patterns=["*.msgpack", "flax_model*", "tf_model*",
+                         "rust_model*", "*.onnx", "onnx/*", "*.mlmodel",
+                         "*.h5", "*.png", "*.jpg", "*.pdf"])
 
 
 def adapter_ready(path: Path) -> bool:
