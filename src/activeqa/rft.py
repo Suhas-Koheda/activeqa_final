@@ -192,7 +192,7 @@ def rft_on_policy(ref, qa, rows, *, candidates=6, batch_questions=8,
                     f"valid={valid_actions / max(1, scored):.2f}  "
                     f"selected={selected_questions / scanned:.2f}  "
                     f"lift={sum(x['reward_lift'] for x in recent) / max(1, len(recent)):+.3f}  "
-                    f"loss={(sum(losses[-20:]) / len(losses[-20:])) if losses else float('nan'):.3f}  "
+                    f"loss={(f'{sum(losses[-20:]) / len(losses[-20:]):.3f}' if losses else '—')}  "
                     f"{rate:.2f} q/s")
         if max_updates is not None and len(losses) >= max_updates:
             if pending:

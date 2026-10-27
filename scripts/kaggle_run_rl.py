@@ -203,16 +203,16 @@ def load_rows(path: str, limit: int, seed: int) -> list[dict]:
     return rows
 
 
-def paired_table(sft: dict, rl: dict) -> str:
+def paired_table(start: dict, rl: dict, start_name: str = "SFT") -> str:
     keys = ("original_f1", "selected_f1", "corrective_f1", "consensus_f1",
             "generation_oracle_f1", "improved_rate", "harmed_rate",
             "switch_rate", "corrective_switch_rate", "corrective_harmed_rate",
             "consensus_switch_rate", "consensus_harmed_rate",
             "valid_generation_rate", "distinct_selected_ratio")
-    lines = [f"  {'metric':28s} {'SFT':>9s} {'RL':>9s} {'delta':>9s}"]
+    lines = [f"  {'metric':28s} {start_name:>9s} {'RL':>9s} {'delta':>9s}"]
     for key in keys:
-        delta = rl[key] - sft[key]
-        lines.append(f"  {key:28s} {sft[key]:>9.4f} {rl[key]:>9.4f} {delta:>+9.4f}")
+        delta = rl[key] - start[key]
+        lines.append(f"  {key:28s} {start[key]:>9.4f} {rl[key]:>9.4f} {delta:>+9.4f}")
     return "\n".join(lines)
 
 
@@ -661,7 +661,7 @@ def main() -> None:
     }
 
     print("\n── Held-out QA: original vs selected reformulation ──────────────")
-    print(paired_table(sft_eval, rl_eval))
+    print(paired_table(sft_eval, rl_eval, start_name.upper()))
     print(f"\n  Consistent selector   RL − SFT selected_f1: {delta:+.4f}   "
           f"paired 95% CI [{selected_ci[0]:+.4f}, {selected_ci[1]:+.4f}]")
     print(f"  Confident correction  RL − SFT corrective_f1: {corrective_delta:+.4f}   "

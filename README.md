@@ -58,6 +58,36 @@ Two safeguards (added after run 3, where RFT degraded a strong SFT start):
   paraphrasing, which is how prior runs made selected QA worse while
   "improving" reward.
 
+First `--from-base` run (raw checkpoint, 640 questions × 2 epochs, 37
+updates, checkpoint floor 0.7186 → best probe at 36 updates 0.7239):
+
+| rule | F1 |
+| --- | --- |
+| original question (do nothing) | **0.7720** |
+| starting policy (raw checkpoint) + consistent | 0.7657 |
+| RL(@36) + consistent | 0.7648 |
+| RL(@36) + corrective | 0.7651 |
+| RL(@36) + corrective, best margin (+2.0) | 0.7762 (SFT sweep) |
+| RL(@36) + consensus | 0.7557 |
+| generation oracle (RL) | 0.7517 |
+
+The machinery did its job exactly as specified: baseline probe logged
+before training, checkpoint probes at 12/24/36/final, checkpoint 36
+detected as the best, shipped and re-evaluated. Honest reading:
+
+* **First CI-above-zero RL delta of the project**: RL vs its own starting
+  policy on the corrective selector is +0.0202 with paired 95% CI
+  [+0.0008, +0.0427]; consensus is +0.0302 but with a CI touching
+  zero [−0.0042, +0.0673]. RL genuinely improved the corrective and
+  consensus selectors relative to where RL started.
+* **But the deployment verdict is unchanged**: every RL selector still
+  lands below answer-the-original 0.7720, so
+  `verdict.recommended_action` stays `original`.
+* The raw checkpoint's rewrites are visibly noisier than the SFT
+  adapter's (raw samples show drifted entities and one Gujarati script
+  spill), and its consistent selector starts *below* do-nothing
+  (0.7657). From-base RL closed some of that gap but not all of it.
+
 ### Measured result (held-out `dev.jsonl`, 200 questions)
 
 Two runs are on record: the previous one trained on the older multi-source
