@@ -106,6 +106,10 @@ def parse_args() -> argparse.Namespace:
                     help="alpha of the fresh LoRA when --from-base")
     ap.add_argument("--rl-mlp", action="store_true",
                     help="also attach LoRA to the feed-forward layers")
+    ap.add_argument("--rl-prompt", default=None,
+                    help="override the paraphrase instruction prompt used by "
+                         "prompted (--model) checkpoints; {question} is the "
+                         "placeholder for the input question")
     ap.add_argument("--preserve-weight", type=float, default=0.2,
                     help="reward weight for entity preservation (0.1 = old "
                          "default); higher punishes entity-text drift")
@@ -331,7 +335,7 @@ def main() -> None:
             f"{', +mlp' if args.rl_mlp else ''})")
         ref = Reformulator(model_path, cache_dir="models", device=device,
                            rank=args.rl_lora_rank, alpha=args.rl_lora_alpha,
-                           include_mlp=args.rl_mlp)
+                           include_mlp=args.rl_mlp, prompt=args.rl_prompt)
     else:
         log(f"      loading SFT adapter {sft_adapter}")
         ref = Reformulator(model_path, cache_dir="models", device=device,
@@ -576,7 +580,8 @@ def main() -> None:
                                    device=ref_device,
                                    rank=args.rl_lora_rank,
                                    alpha=args.rl_lora_alpha,
-                                   include_mlp=args.rl_mlp)
+                                   include_mlp=args.rl_mlp,
+                                   prompt=args.rl_prompt)
             else:
                 ref = Reformulator(model_path, cache_dir="models",
                                    device=ref_device,

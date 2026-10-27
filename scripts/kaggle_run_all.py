@@ -107,6 +107,10 @@ def main() -> int:
     parser.add_argument("--model", default=None,
                         help="HF seq2seq checkpoint for from-base RL "
                              "(e.g. bigscience/mt0-base); implies --from-base")
+    parser.add_argument("--prompt", default=None,
+                        help="override the paraphrase instruction prompt for "
+                             "--model checkpoints ({question} placeholder); "
+                             "forwarded to the RL stage")
     args = parser.parse_args()
     if args.model:
         if args.stage == "sft":
@@ -158,6 +162,8 @@ def main() -> int:
             extra_options = (*extra_options, "--from-base")
         if args.model:
             extra_options = (*extra_options, "--model", args.model)
+        if args.prompt:
+            extra_options = (*extra_options, "--rl-prompt", args.prompt)
         code = run_stage("STAGE 2 — RL", ROOT / "scripts" / "kaggle_run_rl.py",
                          stage_args(args.rl_args, extra_options))
         if code != 0:

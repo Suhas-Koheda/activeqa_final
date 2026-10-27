@@ -101,9 +101,13 @@ class Reformulator:
         if self.target_lang_id == self.tokenizer.unk_token_id:
             # No IndicBART-style language pin: fall back to an instruction
             # prefix in front of the question (mT5/mt0-style checkpoints).
+            # The contract must forbid answering: QA-tuned checkpoints (observed
+            # on bigscience/mt0-base) otherwise emit a one-word answer instead
+            # of a rewritten question.
             self.prompt_template=(prompt
-                or "Paraphrase the following question, keeping its exact meaning "
-                   "and language:\n{question}")
+                or "Rephrase the question below in the same language.\n"
+                   "Output ONLY the rephrased question — do not answer it.\n"
+                   "{question}")
             self.target_lang_id=None
             self.bos_token_id=self.tokenizer.bos_token_id
             self.eos_token_id=(self.tokenizer.eos_token_id
