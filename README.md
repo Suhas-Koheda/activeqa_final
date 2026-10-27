@@ -43,8 +43,15 @@ reformulation is not worth deploying for that policy.
 Two safeguards (added after run 3, where RFT degraded a strong SFT start):
 
 * **`--from-base`** trains RL directly on the raw checkpoint with a fresh
-  LoRA (r=16, α=32 by default) — no SFT stage needed:
+  LoRA (r=32, α=64 by default) — no SFT stage needed:
   `python scripts/kaggle_run_all.py --from-base`.
+* **`--model bigscience/mt0-base`** (any HF seq2seq checkpoint) hangs the
+  same RL loop on a stronger starting policy. Non-IndicBART checkpoints
+  have no `<2te>` language pin, so the reformulator switches to an
+  instruction prompt (`paraphrase … keeping its exact meaning and
+  language`) and mT5-style LoRA targets; `--rl-mlp` adds feed-forward
+  adapters. Snapshot downloads skip ONNX/TF duplicates and go to the
+  freest disk.
 * **Checkpoint selection** saves a probe adapter every
   `--checkpoint-every` optimizer updates (default 12) and measures it with
   the real QA pipeline on a dev subset (`--checkpoint-eval-questions`, default
