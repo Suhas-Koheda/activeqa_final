@@ -9,6 +9,8 @@ the same held-out questions:
     python scripts/kaggle_run_rl.py                 # RL on top of the SFT adapter
     python scripts/kaggle_run_rl.py --from-base     # RL from the raw checkpoint
                                                     # (fresh LoRA, no SFT needed)
+    python scripts/kaggle_run_rl.py --from-base --model bigscience/mt0-base
+                                                    # RL on a stronger prompted checkpoint
 
 The starting policy is the SFT LoRA adapter when available, or the raw
 checkpoint with a fresh LoRA when ``--from-base`` is passed.
@@ -94,22 +96,32 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--from-base", action="store_true",
                     help="train RL directly from the raw checkpoint with a "
                          "fresh LoRA — no SFT stage required")
-    ap.add_argument("--rl-lora-rank", type=int, default=16,
+    ap.add_argument("--model", default=MODEL_ID,
+                    help="any HF seq2seq checkpoint for from-base RL "
+                         "(e.g. bigscience/mt0-base; only used with --from-base "
+                         "unless you are sure the adapter matches)")
+    ap.add_argument("--rl-lora-rank", type=int, default=32,
                     help="rank of the fresh LoRA when --from-base")
-    ap.add_argument("--rl-lora-alpha", type=int, default=32,
+    ap.add_argument("--rl-lora-alpha", type=int, default=64,
                     help="alpha of the fresh LoRA when --from-base")
-    ap.add_argument("--checkpoint-eval-questions", type=int, default=80,
+    ap.add_argument("--rl-mlp", action="store_true",
+                    help="also attach LoRA to the feed-forward layers")
+    ap.add_argument("--preserve-weight", type=float, default=0.2,
+                    help="reward weight for entity preservation (0.1 = old "
+                         "default); higher punishes entity-text drift")
+    ap.add_argument("--checkpoint-eval-questions", type=int, default=200,
                     help="dev questions evaluated at every RL checkpoint "
                          "(checkpoint selection; 0 disables)")
-    ap.add_argument("--checkpoint-every", type=int, default=12,
+    ap.add_argument("--checkpoint-every", type=int, default=8,
                     help="run a checkpoint eval every N optimizer updates")
     ap.add_argument("--out", default=str(RL_DIR),
                     help="run directory; the RL adapter is written to <out>/adapter")
     ap.add_argument("--train", default="data/indic_rag_te/train.jsonl")
     ap.add_argument("--dev", default="data/indic_rag_te/dev.jsonl")
-    ap.add_argument("--questions", type=int, default=640,
-                    help="training questions per epoch (0 = all)")
-    ap.add_argument("--epochs", type=int, default=2)
+    ap.add_argument("--questions", type=int, default=0,
+                    help="training questions per epoch (0 = all; train.jsonl "
+                         "has 804)")
+    ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--candidates", type=int, default=6)
     ap.add_argument("--batch-questions", type=int, default=8,
                     help="selected targets per optimizer update")
@@ -177,14 +189,15 @@ def ensure_deps() -> None:
              [sys.executable, str(Path(__file__).resolve())] + sys.argv[1:])
 
 
-def resolve_model_path() -> str:
-    if LOCAL_MODEL_DIR.is_dir() and (list(LOCAL_MODEL_DIR.glob("*.safetensors"))
-                                     or list(LOCAL_MODEL_DIR.glob("*.bin"))):
-        return str(LOCAL_MODEL_DIR)
+def resolve_model_path(model_id: str = MODEL_ID) -> str:
+    local = ROOT / "models" / model_id.split("/")[-1]
+    if local.is_dir() and (list(local.glob("*.safetensors"))
+                           or list(local.glob("*.bin"))):
+        return str(local)
     from huggingface_hub import snapshot_download
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     return snapshot_download(
-        repo_id=MODEL_ID, local_dir=str(LOCAL_MODEL_DIR),
+        repo_id=model_id, local_dir=str(local),
         ignore_patterns=["*.msgpack", "flax_model*", "tf_model*", "rust_model*"])
 
 
@@ -241,6 +254,9 @@ def main() -> None:
     if args.eval_only and args.from_base:
         raise SystemExit("--eval-only evaluates the SFT adapter; it is "
                          "incompatible with --from-base")
+    if not args.from_base and args.model != MODEL_ID:
+        raise SystemExit("--model applies to --from-base; the SFT adapter was "
+                         f"trained on {MODEL_ID}")
     if not args.from_base and not adapter_ready(sft_adapter):
         raise SystemExit(
             f"SFT adapter not found at {sft_adapter}. Run scripts/colab_run_sft.py "
@@ -278,14 +294,16 @@ def main() -> None:
     from activeqa.rft import rft_on_policy
 
     # ── policy (SFT adapter if present, otherwise the raw checkpoint + LoRA) ─
-    model_path = resolve_model_path()
-    log(f"[2/6] Reformulator {model_path}")
+    model_path = resolve_model_path(args.model)
+    log(f"[2/6] Reformulator {args.model}")
     started = time.perf_counter()
     if args.from_base:
         log(f"      --from-base: no SFT adapter; fresh LoRA "
-            f"(r={args.rl_lora_rank}, alpha={args.rl_lora_alpha})")
+            f"(r={args.rl_lora_rank}, alpha={args.rl_lora_alpha}"
+            f"{', +mlp' if args.rl_mlp else ''})")
         ref = Reformulator(model_path, cache_dir="models", device=device,
-                           rank=args.rl_lora_rank, alpha=args.rl_lora_alpha)
+                           rank=args.rl_lora_rank, alpha=args.rl_lora_alpha,
+                           include_mlp=args.rl_mlp)
     else:
         log(f"      loading SFT adapter {sft_adapter}")
         ref = Reformulator(model_path, cache_dir="models", device=device,
@@ -294,7 +312,8 @@ def main() -> None:
         f"({time.perf_counter() - started:.1f}s)")
     record_status(status_path, "policy_loaded",
                   adapter=str(sft_adapter) if not args.from_base else None,
-                  from_base=args.from_base, trainable=ref.trainable_count)
+                  from_base=args.from_base, model=args.model,
+                  trainable=ref.trainable_count)
 
     qa_started = time.perf_counter()
     log(f"[3/6] Frozen QA reward model {QA_MODEL}")
@@ -470,6 +489,7 @@ def main() -> None:
         seed=args.seed,
         after_update=checkpoint_hook if cp_rows else None,
         skip_solved=True,
+        preserve_weight=args.preserve_weight,
         log=log)
     record_status(status_path, "train_done",
                   optimizer_steps=metrics["optimizer_steps"],
@@ -527,7 +547,8 @@ def main() -> None:
                 ref = Reformulator(model_path, cache_dir="models",
                                    device=ref_device,
                                    rank=args.rl_lora_rank,
-                                   alpha=args.rl_lora_alpha)
+                                   alpha=args.rl_lora_alpha,
+                                   include_mlp=args.rl_mlp)
             else:
                 ref = Reformulator(model_path, cache_dir="models",
                                    device=ref_device,
@@ -554,6 +575,7 @@ def main() -> None:
                   optimizer_steps=metrics["optimizer_steps"],
                   reverted_to_start=reverted)
     (out_dir / "rl_metrics.json").write_text(json.dumps({
+        "model": args.model,
         "training": metrics,
         "sft_adapter": str(sft_adapter),
         "from_base": args.from_base,

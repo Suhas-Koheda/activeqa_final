@@ -6,7 +6,7 @@ from .preprocessing import normalize, entity_signature, interrogatives, tokens
 
 
 _TELUGU_RE = re.compile(r"[\u0c00-\u0c7f]")
-_FOREIGN_INDIC_RE = re.compile(r"[\u0900-\u0bff\u0d00-\u0d7f]")
+_FOREIGN_INDIC_RE = re.compile(r"[\u0900-\u0bff\u0c80-\u0d7f]")
 _OUTPUT_MARKER_RE = re.compile(r"\[(?:more|continued|truncated)\]", re.I)
 _TELUGU_FUNCTION_WORDS = {
     "ఏ", "ఏది", "ఏమి", "ఏమిటి", "ఎవరు", "ఎప్పుడు", "ఎక్కడ", "ఎందుకు", "ఎలా",
@@ -75,14 +75,21 @@ def _anchor_overlap(source, candidate):
 
 class Reformulator:
     def __init__(self, name, cache_dir="models", rank=None, alpha=None, language="te",
-                 device="cpu", adapter_path=None):
+                 device="cpu", adapter_path=None, include_mlp=False, prompt=None):
         from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-        # This checkpoint explicitly documents the slow AlbertTokenizer path. `use_fast=True`
-        # attempts an unsupported conversion and fails when its legacy vocab_file is None.
-        self.tokenizer=AutoTokenizer.from_pretrained(
-            name, cache_dir=cache_dir, use_fast=False,
-            do_lower_case=False, keep_accents=True,
-        )
+        try:
+            # This checkpoint explicitly documents the slow AlbertTokenizer path.
+            # `use_fast=True` attempts an unsupported conversion and fails when
+            # its legacy vocab_file is None.
+            self.tokenizer=AutoTokenizer.from_pretrained(
+                name, cache_dir=cache_dir, use_fast=False,
+                do_lower_case=False, keep_accents=True,
+            )
+        except (TypeError, ValueError):
+            # mT5/mt0-style checkpoints have an ordinary slow T5 tokenizer; the
+            # Albert-only kwargs above are not supported there.
+            self.tokenizer=AutoTokenizer.from_pretrained(
+                name, cache_dir=cache_dir, use_fast=False)
         self.device=torch.device(device)
         self.model=AutoModelForSeq2SeqLM.from_pretrained(name,cache_dir=cache_dir)
         self.model.train()
@@ -92,23 +99,35 @@ class Reformulator:
         self.target_lang_token=f"<2{language}>"
         self.target_lang_id=self.tokenizer._convert_token_to_id_with_added_voc(self.target_lang_token)
         if self.target_lang_id == self.tokenizer.unk_token_id:
-            raise RuntimeError(f"Tokenizer does not contain required language token {self.target_lang_token}")
-        # The model card sets BOS/EOS explicitly; relying on a possibly incomplete
-        # generation_config can make generate() run to max_new_tokens every time.
-        self.bos_token_id=self.tokenizer._convert_token_to_id_with_added_voc("<s>")
-        self.eos_token_id=self.tokenizer._convert_token_to_id_with_added_voc("</s>")
-        if self.bos_token_id == self.tokenizer.unk_token_id:
-            raise RuntimeError("Tokenizer does not define the expected <s> start token")
-        if self.eos_token_id == self.tokenizer.unk_token_id:
-            self.eos_token_id=self.tokenizer.eos_token_id
-        if self.eos_token_id is None or self.eos_token_id == self.tokenizer.unk_token_id:
-            raise RuntimeError("Tokenizer does not define the expected </s> end token")
-        self.model.config.decoder_start_token_id=self.target_lang_id
-        self.model.generation_config.decoder_start_token_id=self.target_lang_id
-        self.model.config.bos_token_id=self.bos_token_id
-        self.model.config.eos_token_id=self.eos_token_id
-        self.model.generation_config.bos_token_id=self.bos_token_id
-        self.model.generation_config.eos_token_id=self.eos_token_id
+            # No IndicBART-style language pin: fall back to an instruction
+            # prefix in front of the question (mT5/mt0-style checkpoints).
+            self.prompt_template=(prompt
+                or "Paraphrase the following question, keeping its exact meaning "
+                   "and language:\n{question}")
+            self.target_lang_id=None
+            self.bos_token_id=self.tokenizer.bos_token_id
+            self.eos_token_id=(self.tokenizer.eos_token_id
+                               if self.tokenizer.eos_token_id is not None else None)
+        else:
+            self.prompt_template=None
+            # The model card sets BOS/EOS explicitly; relying on a possibly incomplete
+            # generation_config can make generate() run to max_new_tokens every time.
+            self.bos_token_id=self.tokenizer._convert_token_to_id_with_added_voc("<s>")
+            self.eos_token_id=self.tokenizer._convert_token_to_id_with_added_voc("</s>")
+            if self.bos_token_id == self.tokenizer.unk_token_id:
+                raise RuntimeError("Tokenizer does not define the expected <s> start token")
+            if self.eos_token_id == self.tokenizer.unk_token_id:
+                self.eos_token_id=self.tokenizer.eos_token_id
+            if self.eos_token_id is None or self.eos_token_id == self.tokenizer.unk_token_id:
+                raise RuntimeError("Tokenizer does not define the expected </s> end token")
+            self.model.config.decoder_start_token_id=self.target_lang_id
+            self.model.generation_config.decoder_start_token_id=self.target_lang_id
+            self.model.config.bos_token_id=self.bos_token_id
+            self.model.config.eos_token_id=self.eos_token_id
+            self.model.generation_config.bos_token_id=self.bos_token_id
+            self.model.generation_config.eos_token_id=self.eos_token_id
+        # The IndicBART-SS tokenizer emits token_type_ids even though mBART
+        # encoder-decoder generation does not accept them; other tokenizers may too.
         # The SFT/RL adapters were trained against exactly this tokenizer/model
         # pair; loading them here keeps every stage (training, eval, deployment)
         # on the same policy instead of silently evaluating the base model.
@@ -121,12 +140,18 @@ class Reformulator:
             self.model.print_trainable_parameters()
         elif rank is not None:
             # RL from the raw checkpoint: attach a fresh LoRA instead of
-            # fine-tuning all 246 M parameters full-parameter (T4-sized).
+            # fine-tuning all parameters (T4-sized).
             from peft import LoraConfig, TaskType, get_peft_model
+            # peft matches these as name *suffixes*, so listing both the
+            # mBART-style names (q_proj/out_proj) and the T5-style names
+            # (q/o) covers either architecture; only Linear layers match.
+            targets = ["q_proj", "k_proj", "v_proj", "out_proj", "q", "k", "v", "o"]
+            if include_mlp:
+                targets += ["fc1", "fc2", "wi", "wo", "wi_0", "wi_1"]
             self.model = get_peft_model(self.model, LoraConfig(
                 r=rank, lora_alpha=(alpha or 2 * rank),
                 lora_dropout=0.05, bias="none", task_type=TaskType.SEQ_2_SEQ_LM,
-                target_modules=["q_proj", "k_proj", "v_proj", "out_proj"]))
+                target_modules=targets))
             self.model.print_trainable_parameters()
         self.model.to(self.device)
         # A trained adapter expects the checkpoint's embeddings to stay tied. A
@@ -155,9 +180,16 @@ class Reformulator:
         self.trainable=[p for p in self.model.parameters() if p.requires_grad]
         self.trainable_count=sum(p.numel() for p in self.trainable)
 
+    def _build_text(self, question):
+        q = normalize(question)
+        if self.prompt_template is not None:
+            return self.prompt_template.format(question=q)
+        return f"{q} </s> {self.target_lang_token}"
+
     def _source(self, question, max_input):
-        text=f"{normalize(question)} </s> {self.target_lang_token}"
-        encoded=self.tokenizer(text,add_special_tokens=False,return_tensors="pt",truncation=True,max_length=max_input)
+        text=self._build_text(question)
+        encoded=self.tokenizer(text,add_special_tokens=self.prompt_template is not None,
+                               return_tensors="pt",truncation=True,max_length=max_input)
         # AlbertTokenizer can emit token_type_ids even though MBART encoder-decoder
         # generation does not accept them.
         return {key:value.to(self.device) for key,value in encoded.items() if key in {"input_ids","attention_mask"}}
@@ -206,9 +238,9 @@ class Reformulator:
         if not questions:
             return []
         encoded=self.tokenizer(
-            [f"{q} </s> {self.target_lang_token}" for q in questions],
-            add_special_tokens=False, return_tensors="pt", padding=True,
-            truncation=True, max_length=max_input)
+            [self._build_text(q) for q in questions],
+            add_special_tokens=self.prompt_template is not None, return_tensors="pt",
+            padding=True, truncation=True, max_length=max_input)
         # AlbertTokenizer can emit token_type_ids even though MBART encoder-decoder
         # generation does not accept them.
         inp={key:value.to(self.device) for key,value in encoded.items()
@@ -218,11 +250,14 @@ class Reformulator:
         generation_kwargs={"max_new_tokens":max_new,"do_sample":do_sample,
                            "num_beams":max(1,n) if not do_sample else 1,
                            "num_return_sequences":n,
-                           "bos_token_id":self.bos_token_id,
-                           "eos_token_id":self.eos_token_id,
-                           "pad_token_id":self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.eos_token_id,
-                           "decoder_start_token_id":self.target_lang_id,
+                           "pad_token_id":self.tokenizer.pad_token_id
+                               if self.tokenizer.pad_token_id is not None
+                               else self.eos_token_id,
                            "use_cache":True}
+        if self.target_lang_id is not None:
+            generation_kwargs.update(bos_token_id=self.bos_token_id,
+                                     eos_token_id=self.eos_token_id,
+                                     decoder_start_token_id=self.target_lang_id)
         generation_kwargs.update(no_repeat_ngram_size=3, encoder_no_repeat_ngram_size=3)
         if do_sample:
             generation_kwargs.update(top_p=.9,temperature=.9)
@@ -336,9 +371,9 @@ class Reformulator:
         if any(not ids for ids in targets):
             raise ValueError("A sampled reformulation must contain at least one generated token")
         encoded=self.tokenizer(
-            [f"{q} </s> {self.target_lang_token}" for q in questions],
-            add_special_tokens=False, return_tensors="pt", padding=True,
-            truncation=True, max_length=max_input)
+            [self._build_text(q) for q in questions],
+            add_special_tokens=self.prompt_template is not None, return_tensors="pt",
+            padding=True, truncation=True, max_length=max_input)
         src={key:value.to(self.device) for key,value in encoded.items()
              if key in {"input_ids","attention_mask"}}
         batch=len(targets)

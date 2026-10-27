@@ -15,6 +15,10 @@ Stages (each in its own process, so the SFT run's memory is released before RL):
 RL without the SFT stage (raw checkpoint + fresh LoRA):
     python scripts/kaggle_run_all.py --from-base
 
+A stronger base checkpoint (any HF seq2seq, prompted — no SFT):
+    python scripts/kaggle_run_all.py --model bigscience/mt0-base
+    python scripts/kaggle_run_all.py --from-base --model bigscience/mt0-large
+
 Rerun only one stage:
     python scripts/kaggle_run_all.py --from rl
     python scripts/kaggle_run_all.py --from sft
@@ -100,7 +104,14 @@ def main() -> int:
                         help="skip SFT; train RL directly on the raw checkpoint "
                              "with a fresh LoRA (no SFT adapter needed); implies "
                              "--from rl and forwards --from-base to the RL stage")
+    parser.add_argument("--model", default=None,
+                        help="HF seq2seq checkpoint for from-base RL "
+                             "(e.g. bigscience/mt0-base); implies --from-base")
     args = parser.parse_args()
+    if args.model:
+        if args.stage == "sft":
+            parser.error("--model is a from-base RL option; use --from all or --from rl")
+        args.stage = "rl"
     if args.from_base:
         if args.stage == "sft":
             parser.error("--from-base skips SFT; use --from all or --from rl")
@@ -145,6 +156,8 @@ def main() -> int:
             extra_options = (*extra_options, "--eval-only")
         if args.from_base:
             extra_options = (*extra_options, "--from-base")
+        if args.model:
+            extra_options = (*extra_options, "--model", args.model)
         code = run_stage("STAGE 2 — RL", ROOT / "scripts" / "kaggle_run_rl.py",
                          stage_args(args.rl_args, extra_options))
         if code != 0:

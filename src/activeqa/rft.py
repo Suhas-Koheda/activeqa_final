@@ -41,18 +41,23 @@ def rft_on_policy(ref, qa, rows, *, candidates=6, batch_questions=8,
                   confidence_slack=0.0, max_input=96, max_new=64,
                   do_sample=True, seed=42, generate_batch=8,
                   max_updates=None, after_update=None, skip_solved=True,
-                  log=print):
+                  preserve_weight=None, log=print):
     """Run RFT on ``rows`` (dicts with question/context/answers).
 
     ``skip_solved``: questions whose original answer is already correct
     (token-F1 ≥ 0.99) are skipped — there is no headroom to learn from and
     training on them only teaches safe paraphrasing of solved cases.
+    ``preserve_weight`` overrides the reward's entity-preservation weight
+    (the checkpoint's default is 0.1); raising it makes the reward punish
+    rewrites that drift entity text (the observed పెద్దగుమ్మడం →
+    పెద్దబొమ్మడం failure mode) instead of mildly discounting them.
     ``after_update(n)`` is called after every optimizer step that reaches
     ``n`` updates; the pipeline uses it to snapshot + evaluate adapters so a
     late drift can never destroy an earlier improvement (checkpoint selection).
     """
     if not rows:
         raise ValueError("RFT needs at least one training question")
+    reward_kwargs = {"preserve_weight": preserve_weight} if preserve_weight is not None else {}
     trainable = [p for p in ref.model.parameters() if p.requires_grad]
     if not trainable:
         raise RuntimeError("The reformulator has no trainable parameters; "
@@ -128,7 +133,7 @@ def rft_on_policy(ref, qa, rows, *, candidates=6, batch_questions=8,
                     log(f"      RFT QA scoring failed ({type(exc).__name__}): {exc}")
                     continue
                 original_reward = reward(answers[0][0], row["answers"],
-                                         valid=True, preserve=1.0)
+                                         valid=True, preserve=1.0, **reward_kwargs)
                 original_confidence = answers[0][2]
                 original_reward_sum += original_reward
                 if (skip_solved and margin >= 0.0
@@ -144,7 +149,7 @@ def rft_on_policy(ref, qa, rows, *, candidates=6, batch_questions=8,
                         entity_signature(action["sampled_text"]))
                     values.append(reward(answer, row["answers"],
                                          valid=action["valid"],
-                                         preserve=float(preserve)))
+                                         preserve=float(preserve), **reward_kwargs))
                     confidences.append(confidence)
                     valid_actions += int(action["valid"])
                     candidate_reward_sum += values[-1]
@@ -236,6 +241,7 @@ def rft_on_policy(ref, qa, rows, *, candidates=6, batch_questions=8,
             "do_sample": do_sample,
             "seed": seed,
             "skip_solved_originals": skip_solved,
+            "preserve_weight": preserve_weight if preserve_weight is not None else 0.1,
         },
     }
     log(f"      RFT done: {scanned} questions, {len(losses)} updates, "
